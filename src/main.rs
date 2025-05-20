@@ -43,6 +43,30 @@ impl Val {
         }
     }
     #[inline(always)]
+    fn int(&self) -> Option<isize> {
+        unsafe {
+            match self.id & TAG_MASK {
+                SYM => (&*(*self.var).name).parse().ok(),
+                CELL => None,
+                FAT => {
+                    if self.is_float() {
+                        match self.fat() {
+                            Fat::Float(x) => Some(*x as isize),
+                            _ => panic!()
+                        }
+                    } else {
+                        None
+                    }
+                }
+                VAR => (&*(*self.sym).name).parse().ok(),
+                _ => {
+                    let result = self.num >> 1;
+                    Some(result)
+                }
+            }
+        }
+    }
+    #[inline(always)]
     fn is_sym (&self) -> bool {
         unsafe {
             match self.id & TAG_MASK {
@@ -465,17 +489,7 @@ impl TryFrom<Val> for isize {
         unsafe {
             match val.id & TAG_MASK {
                 SYM => (&*(*val.var).name).parse().or_else(|_| Err(val)),
-                CELL => Err(val),
-                FAT => {
-                    if val.is_float() {
-                        match val.fat() {
-                            Fat::Float(x) => Ok(*x as isize),
-                            _ => panic!()
-                        }
-                    } else {
-                        Err(val)
-                    }
-                }
+                CELL|FAT => Err(val),
                 VAR => (&*(*val.sym).name).parse().or_else(|_| Err(val)),
                 _ => {
                     let result = val.num >> 1;
@@ -2041,9 +2055,31 @@ fn is(env: &mut Env, mode: Mode, ast: &Val) -> Result<bool, Exception> {
     Ok(true)
 }
 fn mod_(env: &mut Env, mode: Mode, ast: &Val) -> Result<bool, Exception> {
+    let old_stack_len = env.eval_args(ast)?;
+    if old_stack_len + 2  != env.arg_stack.len() {
+      env.arg_stack.truncate(old_stack_len);
+      return Err(env.argument_err("%", env.arg_stack.len(), "2"));
+    }
+    let n = isize::try_from(env.arg_stack.pop().unwrap());
+    let m = isize::try_from(env.arg_stack.pop().unwrap());
+    let n = n.or_else(|v|Err(env.type_err("%", &v, "integer")))?;
+    let m = m.or_else(|v|Err(env.type_err("%", &v, "integer")))?;
+    env.push((n % m).into());
+
     Ok(true)
 }
 fn int(env: &mut Env, mode: Mode, ast: &Val) -> Result<bool, Exception> {
+    let old_stack_len = env.eval_args(ast)?;
+    for i in old_stack_len..env.arg_stack.len() {
+      match env.arg_stack[i].int() {
+        Some(n) => env.arg_stack[i] = n.into(),
+        None => {
+          let v = env.arg_stack[i].clone();
+          env.arg_stack.truncate(old_stack_len);
+          return Err(env.type_err_conv("int", &v));
+        }
+      }
+    }
     Ok(true)
 }
 fn float(env: &mut Env, mode: Mode, ast: &Val) -> Result<bool, Exception> {
