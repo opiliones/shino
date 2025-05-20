@@ -1534,7 +1534,7 @@ fn while_(env: &mut Env, mode: Mode, ast: &Val) -> Result<bool, Exception> {
     let mut stack_len = old_stack_len;
     while env.eval(Mode::Single, cond)? {
         env.ret = env.arg_stack.pop().unwrap();
-        match  env.eval(Mode::Single, cond) {
+        match  env.eval(Mode::Single, body) {
             Ok(x) => {
                 result = x;
                 let _ = env.arg_stack.pop().unwrap();
@@ -1555,7 +1555,9 @@ fn while_(env: &mut Env, mode: Mode, ast: &Val) -> Result<bool, Exception> {
     Ok(result)
 }
 fn mval(env: &mut Env, mode: Mode, ast: &Val) -> Result<bool, Exception> {
-    let result = env.eval(Mode::Multi, ast)?;
+    let mut ast = ast;
+    let body = ast.next().ok_or_else(|| env.argument_err("@", 0, "1"))?;
+    let result = env.eval(Mode::Multi, body)?;
     let val = env.arg_stack.pop().unwrap();
     if val != env.sym.multi_done {
         if val.is_cell() {
@@ -1659,12 +1661,15 @@ fn spawn(env: &mut Env, mode: Mode, ast: &Val) -> Result<bool, Exception> {
             return Err(env.other_err(env.sym.io_err.clone(),
                         "spawn: failed to fork".to_string()));
         } else if pid == 0 {
-            let old_arg_stack_len = env.arg_stack.len();
-            match env.eval(Mode::Multi, ast) {
+            if !ast.is_cell() {
+                exit(0);
+            }
+            let old_stack_len = env.arg_stack.len();
+            match env.eval(mode, ast.car()) {
                 Ok(true) => exit(0),
                 Ok(false) => {
-                    env.arg_stack.truncate(old_arg_stack_len + 1);
-                    let n = if old_arg_stack_len == env.arg_stack.len() {
+                    env.arg_stack.truncate(old_stack_len + 1);
+                    let n = if old_stack_len == env.arg_stack.len() {
                         ONE
                     } else {
                         env.arg_stack.pop().unwrap()
@@ -2080,9 +2085,21 @@ fn int(env: &mut Env, mode: Mode, ast: &Val) -> Result<bool, Exception> {
         }
       }
     }
+    env.stack_to_list(mode, old_stack_len);
     Ok(true)
 }
 fn float(env: &mut Env, mode: Mode, ast: &Val) -> Result<bool, Exception> {
+    let old_stack_len = env.eval_args(ast)?;
+    for i in old_stack_len..env.arg_stack.len() {
+      match f64::try_from(std::mem::replace(&mut env.arg_stack[i], ZERO)) {
+        Ok(f) => env.arg_stack[i] = f.into(),
+        Err(v) => {
+          env.arg_stack.truncate(old_stack_len);
+          return Err(env.type_err_conv("float", &v));
+        }
+      }
+    }
+    env.stack_to_list(mode, old_stack_len);
     Ok(true)
 }
 fn re(env: &mut Env, mode: Mode, ast: &Val) -> Result<bool, Exception> {
