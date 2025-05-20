@@ -1,0 +1,8 @@
+[package]
+name = "shino"
+version = "0.1.0"
+edition = "2021"
+
+[dependencies]
+libc = "0.2.172"
+regex = "1.11.1"
