@@ -437,33 +437,6 @@ impl Val {
             self == x.get().unwrap()
         })
     }
-    fn same(&self, val: &Val) {
-        if self == val {
-            return true;
-        }
-        match unsafe{self.id} & TAG_MASK {
-            CELL => {
-                mut val = val;
-                for i in self {
-                    match val.next() {
-                        Some(j) => {
-                            if !i.same(j) {
-                                return false;
-                            }
-                        }
-                        None => return false
-                    }
-                }
-                if val.next().is_some() {
-                    return false;
-                }
-                true
-            }
-            _ => {
-                self.to_str() == val..to_str()
-            }
-        }
-    }
 }
 
 impl From<isize> for Val {
@@ -949,7 +922,7 @@ impl Env {
     fn eval(&mut self, mode: Mode, ast: &Val) -> Result<bool, Exception> {
         unsafe {
             match ast.id & TAG_MASK {
-                0 => {
+                VAR => {
                     if ast.is_captured() {
                         self.push(ast.captured().clone());
                     } else {
@@ -957,7 +930,7 @@ impl Env {
                     }
                     Ok(true)
                 }
-                8 => self.eval_list(mode, &(*ast.cell).car, &(*ast.cell).cdr),
+                CELL => self.eval_list(mode, &(*ast.cell).car, &(*ast.cell).cdr),
                 _ => {
                     self.push(Val {id: ast.id});
                     Ok(true)
@@ -2020,17 +1993,50 @@ fn same(env: &mut Env, mode: Mode, ast: &Val) -> Result<bool, Exception> {
 
     let v = env.arg_stack.pop().unwrap();
     match unsafe{v.id} & TAG_MASK {
-        CELL => {
+        CELL|FAT if !v.is_float()  => {
+          return Err(env.type_err("=", &v, "symbol or string or number"));
         }
-        FAT if !v.is_float()=> {
-        }
+        _ => {}
     }
+    let s = v.to_str();
     for _ in old_stack_len..env.arg_stack.len() - 1 {
-       if !v.same(env.arg_stack.pop().unwrap()) {
+       if s != env.arg_stack.pop().unwrap().to_str() {
            env.arg_stack.truncate(old_stack_len);
-           return false;
+           env.push(v);
+           return Ok(false);
        }
     }
+    env.push(v);
+
+    Ok(true)
+}
+fn is(env: &mut Env, mode: Mode, ast: &Val) -> Result<bool, Exception> {
+    let old_stack_len = env.arg_stack.len();
+    let mut ast = ast;
+    while ast.is_cell() {
+        if !env.eval(Mode::None, ast.car())? {
+            env.arg_stack.truncate(old_stack_len);
+            return Ok(false);
+        }
+        ast = ast.cdr();
+    }
+
+    if old_stack_len == env.arg_stack.len() {
+        env.push(env.nil());
+        return Ok(true);
+    } else if old_stack_len + 1 == env.arg_stack.len() {
+        return Ok(true);
+    }
+
+    let v = env.arg_stack.pop().unwrap();
+    for _ in old_stack_len..env.arg_stack.len() - 1 {
+       if v != env.arg_stack.pop().unwrap() {
+           env.arg_stack.truncate(old_stack_len);
+           env.push(v);
+           return Ok(false);
+       }
+    }
+    env.push(v);
 
     Ok(true)
 }
