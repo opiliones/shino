@@ -853,6 +853,7 @@ struct Symbols {
     type_err: Val,
     arg_err: Val,
     io_err: Val,
+    regex_err: Val,
     context_err: Val,
     multi_done: Val,
     progn: Val,
@@ -888,6 +889,7 @@ impl Env {
             type_err:"type-error".to_string().intern(),
             arg_err:"argument-error".to_string().intern(),
             io_err:"io-error".to_string().intern(),
+            regex_err:"regex-error".to_string().intern(),
             context_err:"context-error".to_string().intern(),
             multi_done: "multi_done".to_string().to_sym(nil.clone(), nil.clone()),
             unquote: "~".to_string().to_sym(nil.clone(), nil.clone()),
@@ -1912,7 +1914,11 @@ where
         match T::try_from(v) {
             Ok(m) => {
                 if !Op::apply1(n, m) {
-                    env.arg_stack.truncate(stack_len);
+                    if env.arg_stack.len() == stack_len {
+                        env.push(m.into());
+                    } else {
+                        env.arg_stack.truncate(stack_len);
+                    }
                     return Ok(false);
                 }
                 n = m;
@@ -1923,6 +1929,7 @@ where
             }
         }
     }
+    env.push(n.into());
     Ok(true)
 }
 fn calc_fn2<Op>(env: &mut Env, _: Mode, ast: &Val) -> Result<bool, Exception>
@@ -1951,7 +1958,6 @@ where
                     Err(m) => {
                         match fold_fn2::<f64, Op>(env, old_stack_len, m as f64) {
                             Ok(x) => {
-                                env.push(n.into());
                                 return Ok(x);
                             }
                             Err(_) => {
@@ -1961,7 +1967,6 @@ where
                         }
                     }
                     Ok(x) => {
-                        env.push(n.into());
                         return Ok(x);
                     }
                 }
@@ -1974,7 +1979,6 @@ where
                     Ok(f) => {
                         match fold_fn2::<f64, Op>(env, old_stack_len, f) {
                             Ok(x) => {
-                                env.push(f.into());
                                 return Ok(x);
                             }
                             Err(_) => {
@@ -2018,15 +2022,25 @@ fn same(env: &mut Env, mode: Mode, ast: &Val) -> Result<bool, Exception> {
         _ => {}
     }
     let s = v.to_str();
+    let mut u = v.clone();
     for _ in old_stack_len..env.arg_stack.len() - 1 {
-       if s != env.arg_stack.pop().unwrap().to_str() {
-           env.arg_stack.truncate(old_stack_len);
-           env.push(v);
-           return Ok(false);
-       }
+        u = env.arg_stack.pop().unwrap();
+        match unsafe{u.id} & TAG_MASK {
+            CELL|FAT if !u.is_float()  => {
+                return Err(env.type_err("=", &u, "symbol or string or number"));
+            }
+            _ => {}
+        }
+        if s != u.to_str() {
+            if old_stack_len < env.arg_stack.len() {
+                env.arg_stack.truncate(old_stack_len + 1);
+            } else {
+                env.push(u);
+            }
+            return Ok(false);
+        }
     }
-    env.push(v);
-
+    env.push(u);
     Ok(true)
 }
 fn is(env: &mut Env, mode: Mode, ast: &Val) -> Result<bool, Exception> {
@@ -2048,21 +2062,26 @@ fn is(env: &mut Env, mode: Mode, ast: &Val) -> Result<bool, Exception> {
     }
 
     let v = env.arg_stack.pop().unwrap();
+    let mut u = v.clone();
     for _ in old_stack_len..env.arg_stack.len() - 1 {
-       if v != env.arg_stack.pop().unwrap() {
-           env.arg_stack.truncate(old_stack_len);
-           env.push(v);
-           return Ok(false);
-       }
+        u = env.arg_stack.pop().unwrap();
+        if v != u {
+            if old_stack_len < env.arg_stack.len() {
+                env.arg_stack.truncate(old_stack_len + 1);
+            } else {
+                env.push(u);
+            }
+            return Ok(false);
+        }
     }
-    env.push(v);
-
+    env.push(u);
     Ok(true)
 }
 fn mod_(env: &mut Env, mode: Mode, ast: &Val) -> Result<bool, Exception> {
     let old_stack_len = env.eval_args(ast)?;
     if old_stack_len + 2  != env.arg_stack.len() {
       env.arg_stack.truncate(old_stack_len);
+      env.push(env.nil());
       return Err(env.argument_err("%", env.arg_stack.len(), "2"));
     }
     let n = isize::try_from(env.arg_stack.pop().unwrap());
@@ -2103,10 +2122,51 @@ fn float(env: &mut Env, mode: Mode, ast: &Val) -> Result<bool, Exception> {
     Ok(true)
 }
 fn re(env: &mut Env, mode: Mode, ast: &Val) -> Result<bool, Exception> {
-    Ok(true)
+    let old_stack_len = env.arg_stack.len();
+    let mut ast = ast;
+    while ast.is_cell() {
+        if !env.eval(Mode::None, ast.car())? {
+            env.arg_stack.truncate(old_stack_len);
+            return Ok(false);
+        }
+        ast = ast.cdr();
+    }
+
+    if old_stack_len + 2 != env.arg_stack.len() {
+        env.arg_stack.truncate(old_stack_len);
+        env.push(env.nil());
+        return Err(env.argument_err("%", env.arg_stack.len(), "2"));
+    }
+
+    let v = env.arg_stack.pop().unwrap();
+    let u = env.arg_stack.pop().unwrap();
+
+    match unsafe{v.id} & TAG_MASK {
+        CELL|FAT if !v.is_float()  => {
+          return Err(env.type_err("~", &v, "symbol or string or number"));
+        }
+        _ => {}
+    }
+    let re = Regex::new(&v.to_str())
+        .or_else(|_|Err(env.other_err(env.sym.regex_err.clone(),
+        format!("~: {}: invalid regular expression", v))))?;
+
+    match unsafe{u.id} & TAG_MASK {
+        CELL|FAT if !v.is_float()  => {
+          return Err(env.type_err("~", &u, "symbol or string or number"));
+        }
+        _ => {}
+    }
+    let s = u.to_str();
+    let result = re.is_match(&s);
+
+    env.push(u);
+    Ok(result)
 }
 fn not(env: &mut Env, mode: Mode, ast: &Val) -> Result<bool, Exception> {
-    Ok(true)
+    let mut ast = ast;
+    let cmd = ast.next().ok_or_else(|| env.argument_err("not", 0, "1"))?;
+    Ok(env.eval(mode, cmd)?)
 }
 fn is_list(env: &mut Env, mode: Mode, ast: &Val) -> Result<bool, Exception> {
     Ok(true)
