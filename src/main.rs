@@ -78,10 +78,7 @@ impl Val {
     #[inline(always)]
     fn is_num (&self) -> bool {
         unsafe {
-            match self.id & TAG_MASK {
-                NUM => true,
-                _ => false
-            }
+            self.id & NUM == 1
         }
     }
     #[inline(always)]
@@ -327,7 +324,7 @@ impl Val {
             panic!();
         }
         unsafe {
-            &mut(*self.cell).car
+            &(*self.cell).car
         }
     }
     #[inline(always)]
@@ -336,7 +333,7 @@ impl Val {
             panic!();
         }
         unsafe {
-            &mut(*self.cell).cdr
+            &(*self.cell).cdr
         }
     }
     #[inline(always)]
@@ -1030,6 +1027,14 @@ impl Env {
                 list = cons(self.arg_stack.pop().unwrap(), list);
             }
             self.push(list);
+        }
+    }
+    #[inline(always)]
+    fn leave_first_arg_or_nil(&mut self, stack_idx: usize) {
+        if self.arg_stack.len() == stack_idx {
+            self.push(self.nil());
+        } else {
+            self.arg_stack.truncate(stack_idx + 1);
         }
     }
     #[inline(always)]
@@ -2010,10 +2015,8 @@ fn same(env: &mut Env, mode: Mode, ast: &Val) -> Result<bool, Exception> {
         ast = ast.cdr();
     }
 
-    if old_stack_len == env.arg_stack.len() {
-        env.push(env.nil());
-        return Ok(true);
-    } else if old_stack_len + 1 == env.arg_stack.len() {
+    if old_stack_len + 2 > env.arg_stack.len() {
+        env.leave_first_arg_or_nil(old_stack_len);
         return Ok(true);
     }
 
@@ -2057,10 +2060,8 @@ fn is(env: &mut Env, mode: Mode, ast: &Val) -> Result<bool, Exception> {
         ast = ast.cdr();
     }
 
-    if old_stack_len == env.arg_stack.len() {
-        env.push(env.nil());
-        return Ok(true);
-    } else if old_stack_len + 1 == env.arg_stack.len() {
+    if old_stack_len + 2 > env.arg_stack.len() {
+        env.leave_first_arg_or_nil(old_stack_len);
         return Ok(true);
     }
 
@@ -2082,10 +2083,8 @@ fn is(env: &mut Env, mode: Mode, ast: &Val) -> Result<bool, Exception> {
 }
 fn mod_(env: &mut Env, mode: Mode, ast: &Val) -> Result<bool, Exception> {
     let old_stack_len = env.eval_args(ast)?;
-    if old_stack_len + 2  != env.arg_stack.len() {
-      env.arg_stack.truncate(old_stack_len);
-      env.push(env.nil());
-      return Err(env.argument_err("%", env.arg_stack.len(), "2"));
+    if old_stack_len + 2 != env.arg_stack.len() {
+        return Err(env.argument_err("%", env.arg_stack.len() - old_stack_len, "2"));
     }
     let n = isize::try_from(env.arg_stack.pop().unwrap());
     let m = isize::try_from(env.arg_stack.pop().unwrap());
@@ -2097,9 +2096,8 @@ fn mod_(env: &mut Env, mode: Mode, ast: &Val) -> Result<bool, Exception> {
 }
 fn int(env: &mut Env, mode: Mode, ast: &Val) -> Result<bool, Exception> {
     let old_stack_len = env.eval_args(ast)?;
-    if old_stack_len == env.arg_stack.len() {
-        env.push(env.nil());
-        return Err(env.argument_err("%", env.arg_stack.len(), "1"));
+    if old_stack_len + 1 != env.arg_stack.len() {
+        return Err(env.argument_err("int", env.arg_stack.len() - old_stack_len, "1"));
     }
     env.arg_stack.truncate(old_stack_len + 1);
     match env.arg_stack[old_stack_len].int() {
@@ -2113,16 +2111,16 @@ fn int(env: &mut Env, mode: Mode, ast: &Val) -> Result<bool, Exception> {
 }
 fn float(env: &mut Env, mode: Mode, ast: &Val) -> Result<bool, Exception> {
     let old_stack_len = env.eval_args(ast)?;
-    for i in old_stack_len..env.arg_stack.len() {
-      match f64::try_from(std::mem::replace(&mut env.arg_stack[i], ZERO)) {
-        Ok(f) => env.arg_stack[i] = f.into(),
-        Err(v) => {
-          env.arg_stack.truncate(old_stack_len);
-          return Err(env.type_err_conv("float", &v));
-        }
-      }
+    if old_stack_len + 1 != env.arg_stack.len() {
+        return Err(env.argument_err("float", env.arg_stack.len() - old_stack_len, "1"));
     }
-    env.stack_to_list(mode, old_stack_len);
+    match f64::try_from(std::mem::replace(&mut env.arg_stack[old_stack_len], ZERO)) {
+        Ok(f) => env.arg_stack[old_stack_len] = f.into(),
+        Err(v) => {
+            env.push(env.arg_stack[old_stack_len].clone());
+            return Err(env.type_err_conv("float", &v));
+        }
+    }
     Ok(true)
 }
 fn re(env: &mut Env, mode: Mode, ast: &Val) -> Result<bool, Exception> {
@@ -2137,9 +2135,7 @@ fn re(env: &mut Env, mode: Mode, ast: &Val) -> Result<bool, Exception> {
     }
 
     if old_stack_len + 2 != env.arg_stack.len() {
-        env.arg_stack.truncate(old_stack_len);
-        env.push(env.nil());
-        return Err(env.argument_err("%", env.arg_stack.len(), "2"));
+        return Err(env.argument_err("%", env.arg_stack.len() - old_stack_len, "2"));
     }
 
     let v = env.arg_stack.pop().unwrap();
@@ -2168,42 +2164,126 @@ fn re(env: &mut Env, mode: Mode, ast: &Val) -> Result<bool, Exception> {
     Ok(result)
 }
 fn not(env: &mut Env, mode: Mode, ast: &Val) -> Result<bool, Exception> {
-    let mut ast = ast;
-    let cmd = ast.next().ok_or_else(|| env.argument_err("not", 0, "1"))?;
-    Ok(env.eval(mode, cmd)?)
+    Ok(!progn(env, mode, ast)?)
 }
 fn is_list(env: &mut Env, mode: Mode, ast: &Val) -> Result<bool, Exception> {
-    Ok(true)
+    let old_stack_len = env.eval_args(ast)?;
+    if old_stack_len + 1 != env.arg_stack.len() {
+        return Err(env.argument_err("is_list", env.arg_stack.len() - old_stack_len, "1"));
+    }
+    Ok(env.arg_stack[old_stack_len].is_cell() || env.arg_stack[old_stack_len].is_nil())
 }
-fn is_empty(env: &mut Env, mode: Mode, ast: &Val) -> Result<bool, Exception> {
-    Ok(true)
+fn is_atom(env: &mut Env, mode: Mode, ast: &Val) -> Result<bool, Exception> {
+    let old_stack_len = env.eval_args(ast)?;
+    if old_stack_len + 1 != env.arg_stack.len() {
+        return Err(env.argument_err("is_atom", env.arg_stack.len() - old_stack_len, "1"));
+    }
+    Ok(!env.arg_stack[old_stack_len].is_cell())
 }
 fn is_string(env: &mut Env, mode: Mode, ast: &Val) -> Result<bool, Exception> {
-    Ok(true)
+    let old_stack_len = env.eval_args(ast)?;
+    if old_stack_len + 1 != env.arg_stack.len() {
+        return Err(env.argument_err("is_string", env.arg_stack.len() - old_stack_len, "1"));
+    }
+    Ok(env.arg_stack[old_stack_len].is_str() || env.arg_stack[old_stack_len].is_sym())
 }
 fn is_symbol(env: &mut Env, mode: Mode, ast: &Val) -> Result<bool, Exception> {
-    Ok(true)
+    let old_stack_len = env.eval_args(ast)?;
+    if old_stack_len + 1 != env.arg_stack.len() {
+        return Err(env.argument_err("is_symbol", env.arg_stack.len() - old_stack_len, "1"));
+    }
+    Ok(env.arg_stack[old_stack_len].is_sym())
 }
 fn is_variable(env: &mut Env, mode: Mode, ast: &Val) -> Result<bool, Exception> {
-    Ok(true)
+    let old_stack_len = env.eval_args(ast)?;
+    if old_stack_len + 1 != env.arg_stack.len() {
+        return Err(env.argument_err("is_variable", env.arg_stack.len() - old_stack_len, "1"));
+    }
+    Ok(env.arg_stack[old_stack_len].is_var())
 }
 fn is_number(env: &mut Env, mode: Mode, ast: &Val) -> Result<bool, Exception> {
-    Ok(true)
+    let old_stack_len = env.eval_args(ast)?;
+    if old_stack_len + 1 != env.arg_stack.len() {
+        return Err(env.argument_err("is_number", env.arg_stack.len() - old_stack_len, "1"));
+    }
+    Ok(env.arg_stack[old_stack_len].is_num() || env.arg_stack[old_stack_len].is_float())
+}
+fn is_integer(env: &mut Env, mode: Mode, ast: &Val) -> Result<bool, Exception> {
+    let old_stack_len = env.eval_args(ast)?;
+    if old_stack_len + 1 != env.arg_stack.len() {
+        return Err(env.argument_err("is_integer", env.arg_stack.len() - old_stack_len, "1"));
+    }
+    Ok(env.arg_stack[old_stack_len].is_num())
+}
+fn is_float(env: &mut Env, mode: Mode, ast: &Val) -> Result<bool, Exception> {
+    let old_stack_len = env.eval_args(ast)?;
+    if old_stack_len + 1 != env.arg_stack.len() {
+        return Err(env.argument_err("is_float", env.arg_stack.len() - old_stack_len, "1"));
+    }
+    Ok(env.arg_stack[old_stack_len].is_float())
 }
 fn is_stream(env: &mut Env, mode: Mode, ast: &Val) -> Result<bool, Exception> {
-    Ok(true)
+    let old_stack_len = env.eval_args(ast)?;
+    if old_stack_len + 1 != env.arg_stack.len() {
+        return Err(env.argument_err("is_float", env.arg_stack.len() - old_stack_len, "1"));
+    }
+    Ok(env.arg_stack[old_stack_len].is_stream())
 }
 fn is_file(env: &mut Env, mode: Mode, ast: &Val) -> Result<bool, Exception> {
-    Ok(true)
+    let old_stack_len = env.eval_args(ast)?;
+    if old_stack_len + 1 != env.arg_stack.len() {
+        return Err(env.argument_err("is_float", env.arg_stack.len() - old_stack_len, "1"));
+    }
+    Ok(env.arg_stack[old_stack_len].is_file())
 }
 
 fn cons_(env: &mut Env, mode: Mode, ast: &Val) -> Result<bool, Exception> {
+    let old_stack_len = env.eval_args(ast)?;
+    while old_stack_len + 2 > env.arg_stack.len() {
+        env.push(env.nil());
+    }
+
+    let mut cdr = env.arg_stack.pop().unwrap();
+    while env.arg_stack.len() > old_stack_len + 1 {
+        cdr = cons(env.arg_stack.pop().unwrap(), cdr);
+    }
+    if mode == Mode::Multi {
+        env.push(cdr);
+        env.push(env.sym.multi_done.clone());
+    } else {
+        cdr = cons(env.arg_stack.pop().unwrap(), cdr);
+        env.push(cdr);
+    }
     Ok(true)
 }
 fn head(env: &mut Env, mode: Mode, ast: &Val) -> Result<bool, Exception> {
+    let old_stack_len = env.eval_args(ast)?;
+    if old_stack_len + 1 != env.arg_stack.len() {
+        return Err(env.argument_err("head", env.arg_stack.len() - old_stack_len, "1"));
+    }
+    let v = env.arg_stack.pop().unwrap();
+    if v.is_cell() {
+        env.push(v.car().clone());
+    } else if v.is_nil()  {
+        env.push(env.nil());
+    } else {
+        return Err(env.type_err("head", &v, "list"));
+    }
     Ok(true)
 }
 fn rest(env: &mut Env, mode: Mode, ast: &Val) -> Result<bool, Exception> {
+    let old_stack_len = env.eval_args(ast)?;
+    if old_stack_len + 1 != env.arg_stack.len() {
+        return Err(env.argument_err("rest", env.arg_stack.len() - old_stack_len, "1"));
+    }
+    let v = env.arg_stack.pop().unwrap();
+    if v.is_cell() {
+        env.push(v.cdr().clone());
+    } else if v.is_nil()  {
+        env.push(env.nil());
+    } else {
+        return Err(env.type_err("rest", &v, "list"));
+    }
     Ok(true)
 }
 
@@ -2248,9 +2328,63 @@ fn del(env: &mut Env, mode: Mode, ast: &Val) -> Result<bool, Exception> {
 }
 
 fn split(env: &mut Env, mode: Mode, ast: &Val) -> Result<bool, Exception> {
+    let old_stack_len = env.eval_args(ast)?;
+    while old_stack_len + 3 > env.arg_stack.len() {
+        env.push(env.nil());
+    }
+    let n = match isize::try_from(env.arg_stack.pop().unwrap()) {
+        Ok(n) => n as usize,
+        Err(v) if v.is_nil() => usize::MAX,
+        Err(v) => return Err(env.type_err("split", &v, "integer"))
+    };
+    let sep = env.arg_stack.pop().unwrap();
+    let v = env.arg_stack.pop().unwrap();
+    let s = &v.to_str();
+
+    let re = Regex::new(&sep.to_str())
+        .or_else(|_|Err(env.other_err(env.sym.regex_err.clone(),
+        format!("~: {}: invalid regular expression", sep))))?;
+
+    let mut cdr = env.nil();
+    for i in re.splitn(s, n + 1) {
+        env.push(i.to_string().to_str());
+    }
+    env.stack_to_list(mode, old_stack_len);
     Ok(true)
 }
 fn expand(env: &mut Env, mode: Mode, ast: &Val) -> Result<bool, Exception> {
+    let old_stack_len = env.eval_args(ast)?;
+    for old_stack_len..env.arg_stack.len() {
+        env.rest_stack.push(env.arg_stack.pop(),unwarp());
+    }
+    for old_stack_len..env.arg_stack.len() {
+        let vs = env.arg_stack.pop().unwrap();
+        if vs.is_cell() {
+            let strs = expand_rest(env);
+            for post in strs {
+                for v in vs {
+                    let pre = v.to_str();
+                    env.push((pre.to_string() + post.clone()).to_str());
+                }
+            }
+        } else if v.is_fat() && !v.is_float() {
+                return Err(env.type_err("~", &u, "symbol or string or number"));
+        } else {
+
+
+
+    match unsafe{u.id} & TAG_MASK {
+        CELL|FAT if !v.is_float()  => {
+          return Err(env.type_err("~", &u, "symbol or string or number"));
+        }
+        _ => {}
+    }
+
+
+
+
+
+
     Ok(true)
 }
 fn num_to_str(env: &mut Env, mode: Mode, ast: &Val) -> Result<bool, Exception> {
