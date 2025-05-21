@@ -1409,7 +1409,10 @@ fn swap(env: &mut Env, mode: Mode, ast: &Val) -> Result<bool, Exception> {
         i += 1;
         addrs = addrs.cdr();
     }
-    env.stack_to_list(mode, old_stack_len);
+
+    if m == Mode::Multi {
+        env.stack_to_list(mode, old_stack_len);
+    }
     result
 }
 
@@ -2094,17 +2097,18 @@ fn mod_(env: &mut Env, mode: Mode, ast: &Val) -> Result<bool, Exception> {
 }
 fn int(env: &mut Env, mode: Mode, ast: &Val) -> Result<bool, Exception> {
     let old_stack_len = env.eval_args(ast)?;
-    for i in old_stack_len..env.arg_stack.len() {
-      match env.arg_stack[i].int() {
-        Some(n) => env.arg_stack[i] = n.into(),
-        None => {
-          let v = env.arg_stack[i].clone();
-          env.arg_stack.truncate(old_stack_len);
-          return Err(env.type_err_conv("int", &v));
-        }
-      }
+    if old_stack_len == env.arg_stack.len() {
+        env.push(env.nil());
+        return Err(env.argument_err("%", env.arg_stack.len(), "1"));
     }
-    env.stack_to_list(mode, old_stack_len);
+    env.arg_stack.truncate(old_stack_len + 1);
+    match env.arg_stack[old_stack_len].int() {
+        Some(n) => env.arg_stack[old_stack_len] = n.into(),
+        None => {
+            let v = env.arg_stack[old_stack_len].clone();
+            return Err(env.type_err_conv("int", &v));
+        }
+    }
     Ok(true)
 }
 fn float(env: &mut Env, mode: Mode, ast: &Val) -> Result<bool, Exception> {
