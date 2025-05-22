@@ -13,6 +13,7 @@ use std::sync::atomic::{AtomicUsize, Ordering};
 use regex::Regex;
 extern crate libc;
 use libc::{fork, waitpid, pid_t};
+use glob::{glob, Pattern};
 
 union Val {
     id: usize,
@@ -852,6 +853,7 @@ struct Symbols {
     io_err: Val,
     regex_err: Val,
     context_err: Val,
+    glob_err: Val,
     multi_done: Val,
     progn: Val,
     mac: Val,
@@ -888,6 +890,7 @@ impl Env {
             io_err:"io-error".to_string().intern(),
             regex_err:"regex-error".to_string().intern(),
             context_err:"context-error".to_string().intern(),
+            glob_err:"glob-error".to_string().intern(),
             multi_done: "multi_done".to_string().to_sym(nil.clone(), nil.clone()),
             unquote: "~".to_string().to_sym(nil.clone(), nil.clone()),
         };
@@ -2352,39 +2355,103 @@ fn split(env: &mut Env, mode: Mode, ast: &Val) -> Result<bool, Exception> {
     env.stack_to_list(mode, old_stack_len);
     Ok(true)
 }
+fn flat_list(env: &mut Env, result: &mut Vec<String>, xs: &Val, globing: bool) -> Result<(), Exception> {
+    if xs.is_cell() {
+        if xs.car() == &env.sym.glob {
+            result.push(format!("{}", xs.cdr()));
+        } else {
+            for i in xs {
+                flat_list(env, result, i, globing);
+            }
+        }
+    } else if xs.is_fat() && !xs.is_float() {
+        return Err(env.type_err("=", xs, "symbol or string or number"));
+    } else {
+        result.push(if globing {
+            Pattern::escape(&xs.to_str())
+        } else {
+            format!("{}", xs)
+        })
+    }
+    Ok(())
+}
+fn prod(env: &mut Env, left: Vec<String>, right: Val, globing: bool) -> Result<Vec<String>, Exception> {
+    let mut ss = Vec::<String>::new();
+    flat_list(env, &mut ss, &right, globing)?;
+
+    let mut result = Vec::<String>::new();
+    for i in left {
+        for j in &ss {
+            result.push(i.clone() + &j);
+        }
+    }
+    Ok(result)
+}
+fn glob_expand(env: &mut Env, patterns: Vec<String>) -> Result<Vec<String>, Exception> {
+    let mut result = Vec::<String>::new();
+    for i in patterns {
+        let paths = glob(&i).or_else(|_|Err(env.other_err(env.sym.glob_err.clone(),
+                    format!("{}: failed to path name expansion", i))))?;
+        for j in paths {
+            let path = j.or_else(|e|Err(env.other_err(env.sym.glob_err.clone(),
+                            format!("failed to path name expansion: detail = {}", e))))?;
+            result.push(path.to_string_lossy().to_string());
+        }
+    }
+    Ok(result)
+}
+fn brace_expand(env: &mut Env, mode: Mode, globing: bool, l: usize) -> Result<bool, Exception> {
+    let mut result = vec!["".to_string()];
+    for _ in 0..l {
+        let v = env.rest_stack.pop().unwrap();
+        result = prod(env, result, v, globing)?;
+    }
+    if globing {
+        result = glob_expand(env, result)?;
+    }
+    if mode == Mode::Multi {
+        for i in result {
+            env.push(i.to_str());
+        }
+        env.push(env.sym.multi_done.clone());
+    } else {
+        let mut cdr = nil();
+        while let Some(car) = result.pop() {
+            cdr = cons(car.to_str(), cdr);
+        }
+        env.push(cdr);
+    }
+    Ok(true)
+}
 fn expand(env: &mut Env, mode: Mode, ast: &Val) -> Result<bool, Exception> {
     let old_stack_len = env.eval_args(ast)?;
-    for old_stack_len..env.arg_stack.len() {
-        env.rest_stack.push(env.arg_stack.pop(),unwarp());
-    }
-    for old_stack_len..env.arg_stack.len() {
-        let vs = env.arg_stack.pop().unwrap();
-        if vs.is_cell() {
-            let strs = expand_rest(env);
-            for post in strs {
-                for v in vs {
-                    let pre = v.to_str();
-                    env.push((pre.to_string() + post.clone()).to_str());
-                }
-            }
-        } else if v.is_fat() && !v.is_float() {
-                return Err(env.type_err("~", &u, "symbol or string or number"));
-        } else {
-
-
-
-    match unsafe{u.id} & TAG_MASK {
-        CELL|FAT if !v.is_float()  => {
-          return Err(env.type_err("~", &u, "symbol or string or number"));
+    let arg_n = env.arg_stack.len() - old_stack_len;
+    let mut cell_exist = false;
+    let mut globing = false;
+    for _ in 0..arg_n {
+        let v = env.arg_stack.pop().unwrap();
+        if  v.is_fat() && !v.is_float() {
+            return Err(env.type_err("concat", &v, "symbol or string or number or list"));
         }
-        _ => {}
+        if !cell_exist && v.is_cell() {
+            cell_exist = true;
+            if !globing && v.car() == &env.sym.glob {
+                globing == true;
+            }
+        }
+        env.rest_stack.push(v);
     }
 
+    if cell_exist {
+        return brace_expand(env, mode, globing, arg_n);
+    }
 
+    let mut s = String::new();
+    for _ in 0..arg_n {
+        s += &env.rest_stack.pop().unwrap().to_str();
+    }
 
-
-
-
+    env.push(s.to_str());
     Ok(true)
 }
 fn num_to_str(env: &mut Env, mode: Mode, ast: &Val) -> Result<bool, Exception> {
