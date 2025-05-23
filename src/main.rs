@@ -9,6 +9,7 @@ use std::io::{BufReader, ErrorKind};
 use std::io::{self, Read};
 use std::process::{Command, Stdio, exit};
 use std::sync::atomic::{AtomicUsize, Ordering};
+use std::path::{Path, PathBuf};
 
 use regex::Regex;
 extern crate libc;
@@ -38,16 +39,18 @@ const FAT: usize = 24;
 
 impl Val {
     #[inline(always)]
-    fn to_str<'a>(&'a self) -> Cow<'a, str> {
-        unsafe {
-            self.try_into().unwrap_unchecked()
-        }
+    fn to_path<'a>(&'a self) -> Result<Cow<'a, Path>, ()> {
+        self.try_into()
+    }
+    #[inline(always)]
+    fn to_str<'a>(&'a self) -> Result<Cow<'a, str>, ()> {
+        self.try_into()
     }
     #[inline(always)]
     fn int(&self) -> Option<isize> {
         unsafe {
             match self.id & TAG_MASK {
-                SYM => (&*(*self.var).name).parse().ok(),
+                SYM => (&*(*self.var).name).to_string_lossy().parse().ok(),
                 CELL => None,
                 FAT => {
                     if self.is_float() {
@@ -59,7 +62,7 @@ impl Val {
                         None
                     }
                 }
-                VAR => (&*(*self.sym).name).parse().ok(),
+                VAR => (&*(*self.sym).name).to_string_lossy().parse().ok(),
                 _ => {
                     let result = self.num >> 1;
                     Some(result)
@@ -257,8 +260,7 @@ impl Val {
         } else {
             unsafe {
                 let result = Val::new();
-                let mut tmp = Fat::Captured(self);
-                std::mem::swap(&mut tmp, &mut (*result.fat).val);
+                let tmp = std::mem::replace(&mut (*result.fat).val, Fat::Captured(self));
                 std::mem::forget(tmp);
                 (*result.fat).count = 1;
                 result.add_tag(FAT)
@@ -268,8 +270,7 @@ impl Val {
     fn new_file(file: File) -> Val {
         unsafe {
             let result = Val::new();
-            let mut tmp = Fat::File(Box::new(file));
-            std::mem::swap(&mut tmp, &mut (*result.fat).val);
+            let tmp = std::mem::replace(&mut (*result.fat).val, Fat::File(Box::new(file)));
             std::mem::forget(tmp);
             (*result.fat).count = 1;
             result.add_tag(FAT)
@@ -278,8 +279,7 @@ impl Val {
     fn new_stream(strm: Box<dyn StreamAPI>) -> Val {
         unsafe {
             let result = Val::new();
-            let mut tmp = Fat::Stream(strm);
-            std::mem::swap(&mut tmp, &mut (*result.fat).val);
+            let tmp = std::mem::replace(&mut (*result.fat).val, Fat::Stream(strm));
             std::mem::forget(tmp);
             (*result.fat).count = 1;
             result.add_tag(FAT)
@@ -288,8 +288,7 @@ impl Val {
     fn new_dict() -> Val {
         unsafe {
             let result = Val::new();
-            let mut tmp = Fat::Dict(Box::new(HashMap::new()));
-            std::mem::swap(&mut tmp, &mut (*result.fat).val);
+            let tmp = std::mem::replace(&mut (*result.fat).val, Fat::Dict(Box::new(HashMap::new())));
             std::mem::forget(tmp);
             (*result.fat).count = 1;
             result.add_tag(FAT)
@@ -442,7 +441,7 @@ impl Val {
         }
     }
     #[inline(always)]
-    fn dict(&self) -> &mut Box<HashMap<String, Val>> {
+    fn dict(&self) -> &mut Box<HashMap<PathBuf, Val>> {
         if !self.is_dict() {
             panic!();
         }
@@ -472,8 +471,7 @@ impl From<f64> for Val {
     fn from(f: f64) -> Self {
         unsafe {
             let result = Val::new();
-            let mut tmp = Fat::Float(f);
-            std::mem::swap(&mut tmp, &mut (*result.fat).val);
+            let tmp = std::mem::replace(&mut (*result.fat).val, Fat::Float(f));
             std::mem::forget(tmp);
             (*result.fat).count = 1;
             result.add_tag(FAT)
@@ -486,9 +484,9 @@ impl TryFrom<Val> for isize {
     fn try_from(val: Val) -> Result<Self, Self::Error> {
         unsafe {
             match val.id & TAG_MASK {
-                SYM => (&*(*val.var).name).parse().or_else(|_| Err(val)),
+                SYM => (&*(*val.var).name).to_string_lossy().parse().or_else(|_| Err(val)),
                 CELL|FAT => Err(val),
-                VAR => (&*(*val.sym).name).parse().or_else(|_| Err(val)),
+                VAR => (&*(*val.sym).name).to_string_lossy().parse().or_else(|_| Err(val)),
                 _ => {
                     let result = val.num >> 1;
                     std::mem::forget(val);
@@ -504,7 +502,7 @@ impl TryFrom<Val> for f64 {
     fn try_from(val: Val) -> Result<Self, Self::Error> {
         unsafe {
             match val.id & TAG_MASK {
-                SYM => (&*(*val.var).name).parse().or_else(|_| Err(val)),
+                SYM => (&*(*val.var).name).to_string_lossy().parse().or_else(|_| Err(val)),
                 CELL => Err(val),
                 FAT => {
                     if val.is_float() {
@@ -516,7 +514,7 @@ impl TryFrom<Val> for f64 {
                         Err(val)
                     }
                 }
-                VAR => (&*(*val.sym).name).parse().or_else(|_| Err(val)),
+                VAR => (&*(*val.sym).name).to_string_lossy().parse().or_else(|_| Err(val)),
                 _ => {
                     let result = val.num >> 1;
                     std::mem::forget(val);
@@ -526,17 +524,55 @@ impl TryFrom<Val> for f64 {
         }
     }
 }
-impl TryFrom<&Val> for Cow<'_, str> {
+impl TryFrom<Val> for Cow<'_, Path> {
     type Error = Val;
+    #[inline(always)]
+    fn try_from(val: Val) -> Result<Self, Self::Error> {
+        (&val).try_into().or_else(|_|Err(val))
+    }
+}
+impl TryFrom<Val> for Cow<'_, str> {
+    type Error = Val;
+    #[inline(always)]
+    fn try_from(val: Val) -> Result<Self, Self::Error> {
+        (&val).try_into().or_else(|_|Err(val))
+    }
+}
+impl TryFrom<&Val> for Cow<'_, str> {
+    type Error = ();
+    #[inline(always)]
+    fn try_from(val: &Val) -> Result<Self, Self::Error> {
+        Ok(unsafe {
+            match val.id & TAG_MASK {
+                SYM => (*(*val.var).name).to_string_lossy(),
+                VAR => (*(*val.sym).name).to_string_lossy(),
+                CELL => return Err(()),
+                FAT if !val.is_float() => return Err(()),
+                _ => Cow::Owned(format!("{}", val)),
+            }
+        })
+    }
+}
+impl TryFrom<&Val> for Cow<'_, Path> {
+    type Error = ();
     #[inline(always)]
     fn try_from<'a>(val: &'a Val) -> Result<Self, Self::Error> {
         Ok(unsafe {
             match val.id & TAG_MASK {
                 SYM => Cow::Borrowed(&*(*val.var).name),
                 VAR => Cow::Borrowed(&*(*val.sym).name),
-                _ => Cow::Owned(format!("{}", val)),
+                CELL => return Err(()),
+                FAT if !val.is_float() => return Err(()),
+                _ => Cow::Owned(format!("{}", val).into()),
             }
         })
+    }
+}
+impl TryFrom<&Val> for String {
+    type Error = ();
+    #[inline(always)]
+    fn try_from<'a>(val: &'a Val) -> Result<Self, Self::Error> {
+        Cow::<Path>::try_from(val).map(|p|p.to_string_lossy().into_owned())
     }
 }
 impl PartialEq for Val {
@@ -569,9 +605,9 @@ impl fmt::Display for Val {
             match self.id & TAG_MASK {
                 VAR => {
                     if self.is_str() {
-                        write!(f, "{}", *self.var().name)
+                        write!(f, "{}", (*self.var().name).display())
                     } else {
-                        write!(f, "${}", *self.var().name)
+                        write!(f, "${}", (*self.var().name).display())
                     }
                 }
                 CELL => {
@@ -591,7 +627,7 @@ impl fmt::Display for Val {
                     write!(f, ")")
                 }
                 SYM => {
-                    write!(f, "{}", *self.sym().name)
+                    write!(f, "{}", (*self.sym().name).display())
                 }
                 FAT => {
                     let tmp = self.copy().remove_tag(FAT);
@@ -665,13 +701,9 @@ impl Drop for Val {
                         0 => {}
                         1 => {
                             (*self.var).count -= 1;
-                            let mut tmp: Val = Val {sym: ptr::null_mut()};
-                            std::mem::swap(&mut tmp, &mut (*self.var).val);
-                            let mut tmp: Val = Val {sym: ptr::null_mut()};
-                            std::mem::swap(&mut tmp, &mut (*self.var).func);
-                            let mut tmp: *mut String = ptr::null_mut();
-                            std::mem::swap(&mut tmp, &mut (*self.var).name);
-                            let _ = Box::from_raw(tmp);
+                            let _ = std::mem::replace(&mut (*self.var).val, Val{sym: ptr::null_mut()});
+                            let _ = std::mem::replace(&mut (*self.var).func, Val{sym: ptr::null_mut()});
+                            let _ = Box::from_raw(std::mem::replace(&mut (*self.var).name, ptr::null_mut()));
                             NEXT_CELL.with(|next_cell| {
                                 (*self.mem).next = next_cell.get();
                                 next_cell.set(self.mem);
@@ -686,10 +718,8 @@ impl Drop for Val {
                     match (*self.cell).count {
                         0 => {}
                         1 => {
-                            let mut tmp: Val = Val {sym: ptr::null_mut()};
-                            std::mem::swap(&mut tmp, &mut (*self.cell).car);
-                            let mut tmp: Val = Val {sym: ptr::null_mut()};
-                            std::mem::swap(&mut tmp, &mut (*self.cell).cdr);
+                            let _ = std::mem::replace(&mut (*self.cell).car, Val{sym: ptr::null_mut()});
+                            let _ = std::mem::replace(&mut (*self.cell).cdr, Val{sym: ptr::null_mut()});
                             NEXT_CELL.with(|next_cell| {
                                 let val = Val {id: self.id & !TAG_MASK};
                                 let mem = val.mem;
@@ -708,8 +738,7 @@ impl Drop for Val {
                     match (*tmp.fat).count {
                         0 => {}
                         1 => {
-                            let mut v = Fat::Nothing;
-                            std::mem::swap(&mut v, &mut (*tmp.fat).val);
+                            let _ = std::mem::replace(&mut (*tmp.fat).val, Fat::Nothing);
                             NEXT_CELL.with(|next_cell| {
                                 let mem = tmp.mem;
                                 (*mem).next = next_cell.get();
@@ -734,7 +763,7 @@ struct Var {
     val: Val,
     count: usize,
     func: Val,
-    name: *mut String,
+    name: *mut PathBuf,
 }
 
 #[repr(C)]
@@ -755,14 +784,14 @@ enum Fat {
     Float(f64),
     Stream(Box<dyn StreamAPI>),
     File(Box<File>),
-    Dict(Box<HashMap<String, Val>>),
+    Dict(Box<HashMap<PathBuf, Val>>),
     Nothing,
 }
 
 #[repr(C)]
 struct Sym {
     func: Val,
-    name: *mut String,
+    name: *mut PathBuf,
 }
 
 #[repr(C)]
@@ -863,36 +892,36 @@ impl Env {
     fn new(pool_size: usize, stack_size: usize) -> Env {
         Pool::new().add_list();
 
-        let nil = "()".to_string().to_sym(ZERO, ZERO);
+        let nil = "()".to_sym(ZERO, ZERO);
         nil.sym().func = nil.clone();
         let _ = NIL.with(|x| x.set(nil.clone()));
-        let _ = "if".to_string().intern_func(if_);
-        let _ = "+".to_string().intern_func(calc_fn1::<AddOp>);
+        let _ = "if".intern_func(if_);
+        let _ = "+".intern_func(calc_fn1::<AddOp>);
 
         let sym = Symbols {
             t:   1.into(),
             nil: nil.clone(),
-            def: "def".to_string().intern_func(def),
-            progn: "do".to_string().intern_func(progn),
-            mac: "mac".to_string().intern_func(mac),
-            env: "env".to_string().intern_func(env),
-            var: "let".to_string().intern_func(var),
-            read:"read-line".to_string().intern_func(read_line),
-            swap:"set".to_string().intern_func(swap),
-            arg: "args".to_string().intern_func(arg),
-            mval:"@".to_string().intern_func(mval),
-            glob:"glob".to_string().intern(),
-            stdin:"stdin".to_string().intern(),
-            stdout:"stdout".to_string().intern(),
-            stderr:"stderr".to_string().intern(),
-            type_err:"type-error".to_string().intern(),
-            arg_err:"argument-error".to_string().intern(),
-            io_err:"io-error".to_string().intern(),
-            regex_err:"regex-error".to_string().intern(),
-            context_err:"context-error".to_string().intern(),
-            glob_err:"glob-error".to_string().intern(),
-            multi_done: "multi_done".to_string().to_sym(nil.clone(), nil.clone()),
-            unquote: "~".to_string().to_sym(nil.clone(), nil.clone()),
+            def: "def".intern_func(def),
+            progn: "do".intern_func(progn),
+            mac: "mac".intern_func(mac),
+            env: "env".intern_func(env),
+            var: "let".intern_func(var),
+            read:"read-line".intern_func(read_line),
+            swap:"set".intern_func(swap),
+            arg: "args".intern_func(arg),
+            mval:"@".intern_func(mval),
+            glob:"glob".intern(),
+            stdin:"stdin".intern(),
+            stdout:"stdout".intern(),
+            stderr:"stderr".intern(),
+            type_err:"type-error".intern(),
+            arg_err:"argument-error".intern(),
+            io_err:"io-error".intern(),
+            regex_err:"regex-error".intern(),
+            context_err:"context-error".intern(),
+            glob_err:"glob-error".intern(),
+            multi_done: "multi_done".to_sym(nil.clone(), nil.clone()),
+            unquote: "~".to_sym(nil.clone(), nil.clone()),
         };
 
         Self {
@@ -964,7 +993,7 @@ impl Env {
         }
         Ok(old_stack_len)
     }
-    fn eval_cmd(&mut self, _: Mode, cmd: &str, args: &Val) -> Result<bool, Exception> {
+    fn eval_cmd(&mut self, _: Mode, cmd: &Path, args: &Val) -> Result<bool, Exception> {
         let old_stack_len = self.eval_args(args)?;
 
         let mut command = Command::new(cmd);
@@ -1170,7 +1199,7 @@ impl Env {
                 }
                 _ => {
                     match cmd.id & 1 {
-                        1 => self.eval_cmd(mode, &(cmd.num>>1).to_string(), args),
+                        1 => self.eval_cmd(mode, &PathBuf::from((cmd.num>>1).to_string()), args),
                         _ => {
                             let f = Val {id: cmd.id & !FUNC}.func;
                             f(self, mode, args)
@@ -1192,7 +1221,7 @@ trait ToNamedObj {
     fn intern_and_set(self, val: Val, func: Val) -> Val;
     fn intern_func(self, func: Primitive) -> Val;
 }
-impl ToNamedObj for String {
+impl ToNamedObj for PathBuf {
     fn to_str(self) -> Val {
         unsafe {
             let result = Val::new();
@@ -1242,16 +1271,37 @@ impl ToNamedObj for String {
     }
     fn intern_func(self, func: Primitive) -> Val {
         let f = Val{func: func}.add_tag(FUNC);
-        if !self.is_empty() {
-            println!("{} = {:b}", self, unsafe{f.id});
+        if !self.as_os_str().is_empty() {
+            println!("{} = {:b}", self.display(), unsafe{f.id});
         }
         self.intern_and_set(nil().clone(), f)
     }
 }
+impl ToNamedObj for &str {
+    fn to_str(self) -> Val {
+        PathBuf::from(self).to_str()
+    }
+    fn to_sym(self, val: Val, func: Val) -> Val {
+        PathBuf::from(self).to_sym(val, func)
+    }
+    fn to_var(self) -> Val {
+        PathBuf::from(self).to_var()
+    }
+    fn intern(self) -> Val  {
+        PathBuf::from(self).intern()
+    }
+    fn intern_and_set(self, val: Val, f: Val) -> Val {
+        PathBuf::from(self).intern_and_set(val, f)
+    }
+    fn intern_func(self, func: Primitive) -> Val {
+        PathBuf::from(self).intern_func(func)
+    }
+}
+
 
 static POOL_SIZE: AtomicUsize = AtomicUsize::new(1024);
 thread_local!(
-    static SYM_TABLE: RefCell<HashMap<String, Val>> = RefCell::new(HashMap::new());
+    static SYM_TABLE: RefCell<HashMap<PathBuf, Val>> = RefCell::new(HashMap::new());
     static NEXT_CELL: Cell<*mut Mem> = Cell::new(ptr::null_mut());
     static POOL_LIST: RefCell<Option<Box<Pool>>> = RefCell::new(None);
     static NIL: OnceCell<Val> = OnceCell::new();
@@ -2024,29 +2074,25 @@ fn same(env: &mut Env, mode: Mode, ast: &Val) -> Result<bool, Exception> {
     }
 
     let v = env.arg_stack.pop().unwrap();
-    match unsafe{v.id} & TAG_MASK {
-        CELL|FAT if !v.is_float()  => {
-          return Err(env.type_err("=", &v, "symbol or string or number"));
-        }
-        _ => {}
-    }
-    let s = v.to_str();
+    let s = v.to_path()
+        .or_else(|_|Err(env.type_err("=", &v, "symbol or string or number")))?;
     let mut u = v.clone();
     for _ in old_stack_len..env.arg_stack.len() - 1 {
         u = env.arg_stack.pop().unwrap();
-        match unsafe{u.id} & TAG_MASK {
-            CELL|FAT if !u.is_float()  => {
+        match v.to_path() {
+            Err(_)  => {
                 return Err(env.type_err("=", &u, "symbol or string or number"));
             }
-            _ => {}
-        }
-        if s != u.to_str() {
-            if old_stack_len < env.arg_stack.len() {
-                env.arg_stack.truncate(old_stack_len + 1);
-            } else {
-                env.push(u);
+            Ok(t) => {
+                if s != t {
+                    if old_stack_len < env.arg_stack.len() {
+                        env.arg_stack.truncate(old_stack_len + 1);
+                    } else {
+                        env.push(u);
+                    }
+                    return Ok(false);
+                }
             }
-            return Ok(false);
         }
     }
     env.push(u);
@@ -2144,24 +2190,15 @@ fn re(env: &mut Env, mode: Mode, ast: &Val) -> Result<bool, Exception> {
     let v = env.arg_stack.pop().unwrap();
     let u = env.arg_stack.pop().unwrap();
 
-    match unsafe{v.id} & TAG_MASK {
-        CELL|FAT if !v.is_float()  => {
-          return Err(env.type_err("~", &v, "symbol or string or number"));
-        }
-        _ => {}
-    }
-    let re = Regex::new(&v.to_str())
+    let s = v.to_str()
+        .or_else(|_|Err(env.type_err("~", &v, "symbol or string or number")))?;
+    let re = Regex::new(&s)
         .or_else(|_|Err(env.other_err(env.sym.regex_err.clone(),
         format!("~: {}: invalid regular expression", v))))?;
 
-    match unsafe{u.id} & TAG_MASK {
-        CELL|FAT if !v.is_float()  => {
-          return Err(env.type_err("~", &u, "symbol or string or number"));
-        }
-        _ => {}
-    }
-    let s = u.to_str();
-    let result = re.is_match(&s);
+    let t = u.to_str()
+        .or_else(|_|Err(env.type_err("~", &u, "symbol or string or number")))?;
+    let result = re.is_match(&t);
 
     env.push(u);
     Ok(result)
@@ -2303,9 +2340,11 @@ fn dict(env: &mut Env, mode: Mode, ast: &Val) -> Result<bool, Exception> {
 
     let mut result = Val::new_dict();
     for _ in (0..arg_len).step_by(2) {
-        let key = env.rest_stack.pop().unwrap();
+        let key = Cow::<Path>::try_from(env.rest_stack.pop().unwrap())
+            .or_else(|v|Err(env.type_err("dict", &v, "symbol or string or number")))?;
         let val = env.rest_stack.pop().unwrap();
-        result.dict().insert(key.to_str().into_owned(), val);
+
+        result.dict().insert(key.into_owned(), val);
     }
     Ok(true)
 }
@@ -2316,17 +2355,18 @@ fn del(env: &mut Env, mode: Mode, ast: &Val) -> Result<bool, Exception> {
         return Err(env.argument_err("del", arg_len, "2 or more"));
     }
 
-    let mut dict = env.nil();
-    std::mem::swap(&mut dict, &mut env.arg_stack[old_stack_len]);
+    let mut dict = std::mem::replace(&mut env.arg_stack[old_stack_len], ZERO);
     if !dict.is_dict() {
         return Err(env.type_err("del", &dict, "Dictionary"));
     }
 
     for _ in 1..arg_len {
-        dict.dict().remove(&*env.arg_stack.pop().unwrap().to_str());
+        let key = Cow::<Path>::try_from(env.rest_stack.pop().unwrap())
+            .or_else(|v|Err(env.type_err("del", &v, "symbol or string or number")))?;
+        dict.dict().remove(&*key);
     }
 
-    let _ = env.arg_stack.pop();
+    std::mem::swap(&mut env.arg_stack[old_stack_len], &mut dict);
     Ok(true)
 }
 
@@ -2340,68 +2380,71 @@ fn split(env: &mut Env, mode: Mode, ast: &Val) -> Result<bool, Exception> {
         Err(v) if v.is_nil() => usize::MAX,
         Err(v) => return Err(env.type_err("split", &v, "integer"))
     };
-    let sep = env.arg_stack.pop().unwrap();
-    let v = env.arg_stack.pop().unwrap();
-    let s = &v.to_str();
+    let sep = Cow::<str>::try_from(env.arg_stack.pop().unwrap())
+        .or_else(|v|Err(env.type_err("split", &v, "symbol or string or number")))?;
+    let s = Cow::<str>::try_from(env.arg_stack.pop().unwrap())
+        .or_else(|v|Err(env.type_err("split", &v, "symbol or string or number")))?;
 
-    let re = Regex::new(&sep.to_str())
+    let re = Regex::new(&sep)
         .or_else(|_|Err(env.other_err(env.sym.regex_err.clone(),
         format!("~: {}: invalid regular expression", sep))))?;
 
     let mut cdr = env.nil();
-    for i in re.splitn(s, n + 1) {
+    for i in re.splitn(&s, n + 1) {
         env.push(i.to_string().to_str());
     }
     env.stack_to_list(mode, old_stack_len);
     Ok(true)
 }
-fn flat_list(env: &mut Env, result: &mut Vec<String>, xs: &Val, globing: bool) -> Result<(), Exception> {
+fn flat_list(env: &mut Env, result: &mut Vec<PathBuf>, xs: &Val, globing: bool) -> Result<(), Exception> {
     if xs.is_cell() {
         if xs.car() == &env.sym.glob {
-            result.push(format!("{}", xs.cdr()));
+            let s = xs.cdr().to_path()
+                .or_else(|_|Err(env.type_err("++", xs.cdr(), "symbol or string or number")))?;
+            result.push(s.to_path_buf());
         } else {
             for i in xs {
                 flat_list(env, result, i, globing);
             }
         }
-    } else if xs.is_fat() && !xs.is_float() {
-        return Err(env.type_err("=", xs, "symbol or string or number"));
+    } else if globing {
+        let s = xs.to_str()
+            .or_else(|_|Err(env.type_err("++", xs, "symbol or string or number")))?;
+        result.push(Pattern::escape(&*s).into())
     } else {
-        result.push(if globing {
-            Pattern::escape(&xs.to_str())
-        } else {
-            format!("{}", xs)
-        })
+        let s = xs.to_path()
+            .or_else(|_|Err(env.type_err("++", xs, "symbol or string or number")))?;
+        result.push(s.to_path_buf());
     }
     Ok(())
 }
-fn prod(env: &mut Env, left: Vec<String>, right: Val, globing: bool) -> Result<Vec<String>, Exception> {
-    let mut ss = Vec::<String>::new();
+fn prod(env: &mut Env, left: Vec<PathBuf>, right: Val, globing: bool) -> Result<Vec<PathBuf>, Exception> {
+    let mut ss = Vec::<PathBuf>::new();
     flat_list(env, &mut ss, &right, globing)?;
 
-    let mut result = Vec::<String>::new();
+    let mut result = Vec::<PathBuf>::new();
     for i in left {
         for j in &ss {
-            result.push(i.clone() + &j);
+            result.push(i.join(j));
         }
     }
     Ok(result)
 }
-fn glob_expand(env: &mut Env, patterns: Vec<String>) -> Result<Vec<String>, Exception> {
-    let mut result = Vec::<String>::new();
+fn glob_expand(env: &mut Env, patterns: Vec<PathBuf>) -> Result<Vec<PathBuf>, Exception> {
+    let mut result = Vec::<PathBuf>::new();
     for i in patterns {
-        let paths = glob(&i).or_else(|_|Err(env.other_err(env.sym.glob_err.clone(),
-                    format!("{}: failed to path name expansion", i))))?;
+        let paths = glob(&(i.to_string_lossy())).or_else(|_|Err(env.other_err(env.sym.glob_err.clone(),
+                    format!("{}: failed to path name expansion", i.display()))))?;
         for j in paths {
             let path = j.or_else(|e|Err(env.other_err(env.sym.glob_err.clone(),
                             format!("failed to path name expansion: detail = {}", e))))?;
-            result.push(path.to_string_lossy().to_string());
+            result.push(path);
         }
     }
     Ok(result)
 }
 fn brace_expand(env: &mut Env, mode: Mode, globing: bool, l: usize) -> Result<bool, Exception> {
-    let mut result = vec!["".to_string()];
+    let mut result = vec![PathBuf::new()];
     for _ in 0..l {
         let v = env.rest_stack.pop().unwrap();
         result = prod(env, result, v, globing)?;
@@ -2430,9 +2473,6 @@ fn expand(env: &mut Env, mode: Mode, ast: &Val) -> Result<bool, Exception> {
     let mut globing = false;
     for _ in 0..arg_n {
         let v = env.arg_stack.pop().unwrap();
-        if  v.is_fat() && !v.is_float() {
-            return Err(env.type_err("concat", &v, "symbol or string or number or list"));
-        }
         if !cell_exist && v.is_cell() {
             cell_exist = true;
             if !globing && v.car() == &env.sym.glob {
@@ -2446,9 +2486,11 @@ fn expand(env: &mut Env, mode: Mode, ast: &Val) -> Result<bool, Exception> {
         return brace_expand(env, mode, globing, arg_n);
     }
 
-    let mut s = String::new();
+    let mut s = PathBuf::new();
     for _ in 0..arg_n {
-        s += &env.rest_stack.pop().unwrap().to_str();
+        let path = Cow::<Path>::try_from(env.rest_stack.pop().unwrap())
+            .or_else(|v|Err(env.type_err("concat", &v, "symbol or string or number or list")))?;
+        s.push(path);
     }
 
     env.push(s.to_str());
@@ -2482,8 +2524,7 @@ fn pipe(env: &mut Env, mode: Mode, ast: &Val) -> Result<bool, Exception> {
 fn buf(env: &mut Env, _: Mode, ast: &Val) -> Result<bool, Exception> {
     let old_stack_len = env.eval_args(ast)?;
     for i in old_stack_len - 1..env.arg_stack.len() {
-        let mut val = env.nil();
-        std::mem::swap(&mut val, &mut env.arg_stack[i]);
+        let mut val = std::mem::replace(&mut env.arg_stack[i], ZERO);
         if val.is_file() {
             env.arg_stack[i] = Val::new_stream(Box::new(Stream::new(BufReader::new(val.move_file()))));
         } else if val == env.sym.stdin {
@@ -2497,14 +2538,16 @@ fn buf(env: &mut Env, _: Mode, ast: &Val) -> Result<bool, Exception> {
 fn open(env: &mut Env, _: Mode, ast: &Val) -> Result<bool, Exception> {
     let old_stack_len = env.eval_args(ast)?;
     for i in old_stack_len - 1..env.arg_stack.len() {
-        let path = env.arg_stack[i].to_str().into_owned();
+        let mut val = std::mem::replace(&mut env.arg_stack[i], ZERO);
+        let path = val.to_path()
+            .or_else(|_|Err(env.type_err("open", &val, "symbol or string or number")))?;
         match OpenOptions::new().read(true).write(true).create(true).open(&path) {
             Ok(f) => {
                 env.arg_stack[i] = Val::new_file(f);
             }
             Err(e) => {
                 return Err(env.other_err(env.sym.io_err.clone(),
-                format!("open: failed to open {}: error code: {}", path, e)));
+                format!("open: failed to open {}: error code: {}", path.display(), e)));
             }
         }
     }
