@@ -5,11 +5,14 @@ use std::cell::{Cell, OnceCell, RefCell};
 use std::collections::{HashMap, VecDeque};
 use std::fs::{File, OpenOptions, read};
 use std::os::fd::AsRawFd;
-use std::io::{BufReader, ErrorKind};
-use std::io::{self, Read};
+use std::io::{BufRead, BufReader, ErrorKind};
+use std::io::{self, Read, Write, PipeWriter, PipeReader};
 use std::process::{Command, Stdio, exit};
 use std::sync::atomic::{AtomicUsize, Ordering};
 use std::path::{Path, PathBuf};
+use std::os::unix::ffi::OsStringExt;
+use std::os::fd::{FromRawFd, RawFd};
+use std::ffi::OsString;
 
 use regex::Regex;
 extern crate libc;
@@ -179,6 +182,57 @@ impl Val {
         }
     }
     #[inline(always)]
+    fn is_fd (&self) -> bool {
+        unsafe {
+            match self.id & TAG_MASK {
+                FAT => {
+                    let fat = self.copy().remove_tag(FAT);
+                    let result = match &(*fat.fat).val {
+                        Fat::Fd(_) => true,
+                        _ => false
+                    };
+                    std::mem::forget(fat);
+                    result
+                }
+                _ => false
+            }
+        }
+    }
+    #[inline(always)]
+    fn is_piper (&self) -> bool {
+        unsafe {
+            match self.id & TAG_MASK {
+                FAT => {
+                    let fat = self.copy().remove_tag(FAT);
+                    let result = match &(*fat.fat).val {
+                        Fat::PipeR(_) => true,
+                        _ => false
+                    };
+                    std::mem::forget(fat);
+                    result
+                }
+                _ => false
+            }
+        }
+    }
+    #[inline(always)]
+    fn is_pipew (&self) -> bool {
+        unsafe {
+            match self.id & TAG_MASK {
+                FAT => {
+                    let fat = self.copy().remove_tag(FAT);
+                    let result = match &(*fat.fat).val {
+                        Fat::PipeW(_) => true,
+                        _ => false
+                    };
+                    std::mem::forget(fat);
+                    result
+                }
+                _ => false
+            }
+        }
+    }
+    #[inline(always)]
     fn is_captured (&self) -> bool {
         unsafe {
             match self.id & TAG_MASK {
@@ -271,6 +325,33 @@ impl Val {
         unsafe {
             let result = Val::new();
             let tmp = std::mem::replace(&mut (*result.fat).val, Fat::File(Box::new(file)));
+            std::mem::forget(tmp);
+            (*result.fat).count = 1;
+            result.add_tag(FAT)
+        }
+    }
+    fn new_fd(fd: usize) -> Val {
+        unsafe {
+            let result = Val::new();
+            let tmp = std::mem::replace(&mut (*result.fat).val, Fat::Fd(fd));
+            std::mem::forget(tmp);
+            (*result.fat).count = 1;
+            result.add_tag(FAT)
+        }
+    }
+    fn new_piper(r: PipeReader) -> Val {
+        unsafe {
+            let result = Val::new();
+            let tmp = std::mem::replace(&mut (*result.fat).val, Fat::PipeR(Box::new(r)));
+            std::mem::forget(tmp);
+            (*result.fat).count = 1;
+            result.add_tag(FAT)
+        }
+    }
+    fn new_pipew(w: PipeWriter) -> Val {
+        unsafe {
+            let result = Val::new();
+            let tmp = std::mem::replace(&mut (*result.fat).val, Fat::PipeW(Box::new(w)));
             std::mem::forget(tmp);
             (*result.fat).count = 1;
             result.add_tag(FAT)
@@ -394,6 +475,16 @@ impl Val {
         }
     }
     #[inline(always)]
+    fn file(&self) -> &mut File {
+        if !self.is_file() {
+            panic!();
+        }
+        match self.fat() {
+            Fat::File(x) => x.as_mut(),
+            _ => panic!()
+        }
+    }
+    #[inline(always)]
     fn clone_file(&self) -> File {
         if !self.is_file() {
             panic!();
@@ -415,6 +506,42 @@ impl Val {
             _ => panic!()
         }
     }
+    #[inline(always)]
+    fn clone_piper(&self) -> PipeReader {
+        if !self.is_piper() {
+            panic!();
+        }
+        let mut tmp = Fat::Nothing;
+        std::mem::swap(&mut tmp, &mut self.fat());
+        match tmp {
+            Fat::PipeR(r) => r.try_clone().unwrap(),
+            _ => panic!()
+        }
+    }
+    #[inline(always)]
+    fn move_piper(&self) -> PipeReader {
+        if !self.is_piper() {
+            panic!();
+        }
+        let mut tmp = Fat::Nothing;
+        std::mem::swap(&mut tmp, &mut self.fat());
+        match tmp {
+            Fat::PipeR(r) => *r,
+            _ => panic!()
+        }
+    }
+    #[inline(always)]
+    fn clone_pipew(&self) -> PipeWriter {
+        if !self.is_pipew() {
+            panic!();
+        }
+        let mut tmp = Fat::Nothing;
+        std::mem::swap(&mut tmp, &mut self.fat());
+        match tmp {
+            Fat::PipeW(w) => w.try_clone().unwrap(),
+            _ => panic!()
+        }
+    }
     fn to_stdio(&self, env: &mut Env) -> Result<Stdio, Exception> {
         if self == &env.sym.stdout {
             Ok(Stdio::from(io::stdout()))
@@ -424,6 +551,10 @@ impl Val {
             Ok(Stdio::inherit())
         } else if self.is_file() {
             Ok(Stdio::from(self.clone_file()))
+        } else if self.is_piper() {
+            Ok(Stdio::from(self.clone_piper()))
+        } else if self.is_pipew() {
+            Ok(Stdio::from(self.clone_pipew()))
         } else {
             Err(env.type_err("shino", self, "fd"))
         }
@@ -436,6 +567,42 @@ impl Val {
         unsafe {
             match self.fat() {
                 Fat::Captured(x) => x,
+                _ => panic!()
+            }
+        }
+    }
+    #[inline(always)]
+    fn fd(&self) -> &mut usize {
+        if !self.is_fd() {
+            panic!();
+        }
+        unsafe {
+            match self.fat() {
+                Fat::Fd(x) => x,
+                _ => panic!()
+            }
+        }
+    }
+    #[inline(always)]
+    fn piper(&self) -> &mut PipeReader {
+        if !self.is_piper() {
+            panic!();
+        }
+        unsafe {
+            match self.fat() {
+                Fat::PipeR(x) => x.as_mut(),
+                _ => panic!()
+            }
+        }
+    }
+    #[inline(always)]
+    fn pipew(&self) -> &mut PipeWriter {
+        if !self.is_pipew() {
+            panic!();
+        }
+        unsafe {
+            match self.fat() {
+                Fat::PipeW(x) => x.as_mut(),
                 _ => panic!()
             }
         }
@@ -457,6 +624,53 @@ impl Val {
         NIL.with(|x| unsafe {
             self == x.get().unwrap()
         })
+    }
+    #[inline(always)]
+    fn read_until(&mut self, byte: u8, buf: &mut Vec<u8>) -> Result<usize, std::io::Error> {
+        let mut len = 0;
+        let mut buffer = [0u8; 1];
+        if self.is_fd() {
+            match self.fd() {
+                0 => {
+                    loop {
+                        let l = std::io::stdin().read(&mut buffer)?;
+                        if l == 0 || buffer[0] == byte {
+                            return Ok(len);
+                        } else {
+                            len += l;
+                            buf.push(buffer[0]);
+                        }
+                    }
+                }
+                _ => Ok(0)
+            }
+        } else if self.is_file() {
+            let file = self.file();
+            loop {
+                let l = file.read(&mut buffer)?;
+                if l == 0 || buffer[0] == byte {
+                    return Ok(len);
+                } else {
+                    len += l;
+                    buf.push(buffer[0]);
+                }
+            }
+        } else if self.is_stream() {
+            self.stream().read_until(byte, buf)
+        } else if self.is_piper() {
+            let pipe = self.piper();
+            loop {
+                let l = pipe.read(&mut buffer)?;
+                if l == 0 || buffer[0] == byte {
+                    return Ok(len);
+                } else {
+                    len += l;
+                    buf.push(buffer[0]);
+                }
+            }
+        } else {
+            Ok(0)
+        }
     }
 }
 
@@ -636,6 +850,9 @@ impl fmt::Display for Val {
                         Fat::Float(r) => write!(f, "{}", r),
                         Fat::Stream(x) => write!(f, "Stream"),
                         Fat::File(x) => write!(f, "{}", x.as_raw_fd()),
+                        Fat::PipeR(x) => write!(f, "{}", x.as_raw_fd()),
+                        Fat::PipeW(x) => write!(f, "{}", x.as_raw_fd()),
+                        Fat::Fd(x) => write!(f, "{}", x),
                         Fat::Dict(x) => write!(f, "Dictionary"),
                         Fat::Nothing => write!(f, "Nothing"),
                     };
@@ -758,6 +975,62 @@ impl Drop for Val {
     }
 }
 
+impl std::io::Read for Val {
+    fn read(&mut self, buf: &mut [u8]) -> Result<usize, std::io::Error> {
+        if self.is_fd() {
+            match self.fd() {
+                0 => std::io::stdin().read(buf),
+                _ => Ok(0)
+            }
+        } else if self.is_num() {
+            let fd = self.int().unwrap() as RawFd;
+            let mut file = unsafe { File::from_raw_fd(fd) };
+            let result = file.read(buf);
+            std::mem::forget(file);
+            result
+        } else if self.is_file() {
+            self.file().read(buf)
+        } else if self.is_piper() {
+            self.piper().read(buf)
+        } else if self.is_stream() {
+            self.stream().read(buf)
+        } else {
+            Ok(0)
+        }
+    }
+}
+
+impl std::io::Write for Val {
+    fn write(&mut self, buf: &[u8]) -> Result<usize, std::io::Error> {
+        if self.is_fd() {
+            match self.fd() {
+                1 => std::io::stdout().write(buf),
+                _ => Ok(0)
+            }
+        } else if self.is_file() {
+            self.file().write(buf)
+        } else if self.is_pipew() {
+            self.pipew().write(buf)
+        } else {
+            Ok(0)
+        }
+    }
+    fn flush(&mut self) -> Result<(), std::io::Error> {
+        if self.is_fd() {
+            match self.fd() {
+                1 => std::io::stdout().flush(),
+                _ => Ok(())
+            }
+        } else if self.is_file() {
+            self.file().flush()
+        } else if self.is_pipew() {
+            self.pipew().flush()
+        } else {
+            Ok(())
+        }
+    }
+}
+
 #[repr(C)]
 struct Var {
     val: Val,
@@ -784,6 +1057,9 @@ enum Fat {
     Float(f64),
     Stream(Box<dyn StreamAPI>),
     File(Box<File>),
+    Fd(usize),
+    PipeR(Box<PipeReader>),
+    PipeW(Box<PipeWriter>),
     Dict(Box<HashMap<PathBuf, Val>>),
     Nothing,
 }
@@ -877,12 +1153,15 @@ struct Symbols {
     stdin: Val,
     stdout: Val,
     stderr: Val,
+    ifs: Val,
     type_err: Val,
     arg_err: Val,
     io_err: Val,
+    syscall_err: Val,
     regex_err: Val,
     context_err: Val,
     glob_err: Val,
+    encode_err: Val,
     multi_done: Val,
     progn: Val,
     mac: Val,
@@ -898,6 +1177,10 @@ impl Env {
         let _ = "if".intern_func(if_);
         let _ = "+".intern_func(calc_fn1::<AddOp>);
 
+        let std_in  = "/dev/fd/0".to_sym(nil.clone(), nil.clone());
+        let std_out = "/dev/fd/1".to_sym(nil.clone(), nil.clone());
+        let std_err = "/dev/fd/2".to_sym(nil.clone(), nil.clone());
+
         let sym = Symbols {
             t:   1.into(),
             nil: nil.clone(),
@@ -906,20 +1189,23 @@ impl Env {
             mac: "mac".intern_func(mac),
             env: "env".intern_func(env),
             var: "let".intern_func(var),
-            read:"read-line".intern_func(read_line),
+            read:"read".intern_func(read_line),
             swap:"set".intern_func(swap),
             arg: "args".intern_func(arg),
             mval:"@".intern_func(mval),
             glob:"glob".intern(),
-            stdin:"stdin".intern(),
-            stdout:"stdout".intern(),
-            stderr:"stderr".intern(),
+            stdin: "STDIN".intern_and_set(Val::new_fd(0), nil.clone()).remove_tag(SYM),
+            stdout:"STDOUT".intern_and_set(Val::new_fd(1), nil.clone()).remove_tag(SYM),
+            stderr:"STDERR".intern_and_set(Val::new_fd(2), nil.clone()).remove_tag(SYM),
+            ifs:"IFS".intern_and_set(" ".intern(), nil.clone()).remove_tag(SYM),
             type_err:"type-error".intern(),
             arg_err:"argument-error".intern(),
             io_err:"io-error".intern(),
+            syscall_err:"systemcall-error".intern(),
             regex_err:"regex-error".intern(),
             context_err:"context-error".intern(),
             glob_err:"glob-error".intern(),
+            encode_err:"encode-error".intern(),
             multi_done: "multi_done".to_sym(nil.clone(), nil.clone()),
             unquote: "~".to_sym(nil.clone(), nil.clone()),
         };
@@ -960,6 +1246,18 @@ impl Env {
         self.other_err(self.sym.type_err.clone(),
             format!("{}: {}: non-numeric string", name, given))
     }
+    fn read_err(&mut self, name: &str, e: std::io::Error) -> Exception {
+        self.other_err(self.sym.io_err.clone(),
+            format!("{}: read error, detail={}", name, e))
+    }
+    fn regex_err(&mut self, name: &str, given: &str) -> Exception {
+        self.other_err(self.sym.regex_err.clone(),
+            format!("{}: {}: invalid regular expression", name, given))
+    }
+    fn encode_err(&mut self, name: &str, given: isize) -> Exception {
+        self.other_err(self.sym.encode_err.clone(),
+            format!("{}: invalid unicode", given))
+    }
     fn push(&mut self, v: Val) {
         self.arg_stack.push(v);
     }
@@ -999,7 +1297,9 @@ impl Env {
         let mut command = Command::new(cmd);
         for _ in old_stack_len..self.arg_stack.len() {
             let v = self.arg_stack.pop().unwrap();
-            command.arg(format!("{}", v));
+            let s = v.to_path()
+                .or_else(|_|Err(self.type_err("shino", &v, "symbol or string or number")))?;
+            command.arg(&*s);
         }
 
         command.output();
@@ -1010,12 +1310,12 @@ impl Env {
                         self.push((code as isize).into());
                         Ok(code == 0)
                     }
-                    None => Err(self.other_err(self.sym.io_err.clone(),
+                    None => Err(self.other_err(self.sym.syscall_err.clone(),
                                 "unknown error code".to_string()))
                 }
             }
             Err(e) => {
-                Err(self.other_err(self.sym.io_err.clone(),
+                Err(self.other_err(self.sym.syscall_err.clone(),
                     format!("{:?}", e)))
             }
         }
@@ -1313,7 +1613,7 @@ fn nil() -> Val {
 
 struct Stream<R: std::io::Read> {
     reader: BufReader<R>,
-    buf: VecDeque<char>,
+    buf: VecDeque<u8>,
     line: usize
 }
 #[derive(Debug)]
@@ -1341,23 +1641,22 @@ impl fmt::Display for ParseErr {
         }
     }
 }
-
 trait StreamAPI {
-    fn peek(&mut self) -> Result<char, ParseErr>;
-    fn any_char(&mut self) -> Result<char, ParseErr>;
-    fn restore(&mut self, c: char);
+    fn peek(&mut self) -> Result<u8, ParseErr>;
+    fn restore(&mut self, c: u8);
+    fn read(&mut self, buf: &mut [u8]) -> Result<usize, std::io::Error>;
+    fn byte(&mut self, c: u8) -> Result<u8, ParseErr>;
+    fn read_until(&mut self, byte: u8, buf: &mut Vec<u8>) -> Result<usize, std::io::Error>;
 }
 impl<R: std::io::Read> StreamAPI for Stream<R> {
-    fn peek(&mut self) -> Result<char, ParseErr> {
+    fn peek(&mut self) -> Result<u8, ParseErr> {
         if self.buf.is_empty() {
             let mut buf = [0u8; 1];
             loop {
                 match self.read_with_block(&mut buf) {
                     Ok(1) => {
-                        let c =  char::from_u32(buf[0].into())
-                            .ok_or_else(||ParseErr::InvalidUniCode(self.line, buf[0]))?;
-                        self.buf.push_back(c);
-                        break Ok(c);
+                        self.buf.push_back(buf[0]);
+                        break Ok(buf[0]);
                     }
                     Ok(_) => {
                         break Err(ParseErr::Eof);
@@ -1374,18 +1673,47 @@ impl<R: std::io::Read> StreamAPI for Stream<R> {
             }
         }
     }
-    fn any_char(&mut self) -> Result<char, ParseErr> {
-        let c = self.peek()?;
-        if c == '\n' {
-            self.line += 1;
+    fn restore(&mut self, c: u8) {
+        self.buf.push_front(c);
+    }
+    fn read(&mut self, buf: &mut [u8]) -> Result<usize, std::io::Error> {
+        let len = self.buf.len().min(buf.len());
+        for i in 0..len {
+            unsafe {
+                buf[i] = self.buf.pop_front().unwrap_unchecked();
+            }
         }
-        unsafe {
-            self.buf.pop_front().unwrap_unchecked();
-            Ok(c)
+        if len < buf.len() {
+            Ok(len + self.read_with_block(&mut buf[len..])?)
+        } else {
+            Ok(len)
         }
     }
-    fn restore(&mut self, c: char) {
-        self.buf.push_front(c);
+    fn byte(&mut self, c: u8) -> Result<u8, ParseErr> {
+        if c == self.peek()? {
+            self.any_byte()
+        } else {
+            Err(ParseErr::TokenEnd)
+        }
+    }
+    fn read_until(&mut self, byte: u8, buf: &mut Vec<u8>) -> Result<usize, std::io::Error> {
+        if self.buf.is_empty() {
+            return self.reader.read_until(byte, buf);
+        }
+        let mut len = 0;
+        for i in &self.buf {
+            if i == &byte {
+                for _ in 0..len {
+                    buf.push(unsafe{self.buf.pop_front().unwrap_unchecked()});
+                }
+                return Ok(len);
+            }
+            len += 1;
+        }
+        let tmp = vec![];
+        len += self.reader.read_until(byte, buf)?;
+        buf.extend(&self.buf).extend(tmp);
+        Ok(len)
     }
 }
 
@@ -1401,11 +1729,14 @@ impl<R: std::io::Read> Stream<R> {
             x => x
         }
     }
-    fn char_of(&mut self, c: char) -> Result<char, ParseErr> {
-        if c == self.peek()? {
-            self.any_char()
-        } else {
-            Err(ParseErr::TokenEnd)
+    fn any_byte(&mut self) -> Result<u8, ParseErr> {
+        let c = self.peek()?;
+        if c == '\n' as u8 {
+            self.line += 1;
+        }
+        unsafe {
+            self.buf.pop_front().unwrap_unchecked();
+            Ok(c)
         }
     }
 }
@@ -1721,7 +2052,7 @@ fn spawn(env: &mut Env, mode: Mode, ast: &Val) -> Result<bool, Exception> {
     unsafe {
         let pid = fork();
         if pid == -1 {
-            return Err(env.other_err(env.sym.io_err.clone(),
+            return Err(env.other_err(env.sym.syscall_err.clone(),
                         "spawn: failed to fork".to_string()));
         } else if pid == 0 {
             if !ast.is_cell() {
@@ -2193,8 +2524,7 @@ fn re(env: &mut Env, mode: Mode, ast: &Val) -> Result<bool, Exception> {
     let s = v.to_str()
         .or_else(|_|Err(env.type_err("~", &v, "symbol or string or number")))?;
     let re = Regex::new(&s)
-        .or_else(|_|Err(env.other_err(env.sym.regex_err.clone(),
-        format!("~: {}: invalid regular expression", v))))?;
+        .or_else(|_|Err(env.regex_err("~", &s)))?;
 
     let t = u.to_str()
         .or_else(|_|Err(env.type_err("~", &u, "symbol or string or number")))?;
@@ -2372,6 +2702,9 @@ fn del(env: &mut Env, mode: Mode, ast: &Val) -> Result<bool, Exception> {
 
 fn split(env: &mut Env, mode: Mode, ast: &Val) -> Result<bool, Exception> {
     let old_stack_len = env.eval_args(ast)?;
+    if env.arg_stack.len() - old_stack_len > 3 {
+        return Err(env.argument_err("split", env.arg_stack.len() - old_stack_len, "1~3"));
+    }
     while old_stack_len + 3 > env.arg_stack.len() {
         env.push(env.nil());
     }
@@ -2386,8 +2719,7 @@ fn split(env: &mut Env, mode: Mode, ast: &Val) -> Result<bool, Exception> {
         .or_else(|v|Err(env.type_err("split", &v, "symbol or string or number")))?;
 
     let re = Regex::new(&sep)
-        .or_else(|_|Err(env.other_err(env.sym.regex_err.clone(),
-        format!("~: {}: invalid regular expression", sep))))?;
+        .or_else(|_|Err(env.regex_err("split", &sep)))?;
 
     let mut cdr = env.nil();
     for i in re.splitn(&s, n + 1) {
@@ -2437,7 +2769,7 @@ fn glob_expand(env: &mut Env, patterns: Vec<PathBuf>) -> Result<Vec<PathBuf>, Ex
                     format!("{}: failed to path name expansion", i.display()))))?;
         for j in paths {
             let path = j.or_else(|e|Err(env.other_err(env.sym.glob_err.clone(),
-                            format!("failed to path name expansion: detail = {}", e))))?;
+                            format!("failed to path name expansion: detail={}", e))))?;
             result.push(path);
         }
     }
@@ -2496,58 +2828,157 @@ fn expand(env: &mut Env, mode: Mode, ast: &Val) -> Result<bool, Exception> {
     env.push(s.to_str());
     Ok(true)
 }
-fn num_to_str(env: &mut Env, mode: Mode, ast: &Val) -> Result<bool, Exception> {
+fn str(env: &mut Env, mode: Mode, ast: &Val) -> Result<bool, Exception> {
+    let old_stack_len = env.eval_args(ast)?;
+    let arg_n = env.arg_stack.len() - old_stack_len;
+    for _ in 0..arg_n {
+        env.rest_stack.push(env.arg_stack.pop().unwrap());
+    }
+    let mut bytes = Vec::with_capacity(arg_n);
+    for _ in 0..arg_n {
+        let n: isize = env.rest_stack.pop().unwrap().try_into()
+            .or_else(|v|Err(env.type_err_conv("str", &v)))?;
+        if n > u32::MAX as isize {
+            return Err(env.encode_err("str", n))?;
+        }
+        let ch = std::char::from_u32(n as u32)
+            .ok_or_else(||env.encode_err("str", n))?;
+        let mut buf = [0; 4];
+        bytes.extend_from_slice(ch.encode_utf8(&mut buf).as_bytes());
+    }
+    env.push(PathBuf::from(OsString::from_vec(bytes)).to_str());
     Ok(true)
 }
 
 fn read_line(env: &mut Env, mode: Mode, ast: &Val) -> Result<bool, Exception> {
+    let mut buf = vec![];
+    let _ = env.sym.stdin.var().val.read_until(b'\n', &mut buf)
+        .or_else(|e|Err(env.read_err("read-line", e)));
+    env.push(PathBuf::from(OsString::from_vec(buf)).to_str());
     Ok(true)
 }
-fn read_char(env: &mut Env, mode: Mode, ast: &Val) -> Result<bool, Exception> {
-    Ok(true)
+fn readb(env: &mut Env, mode: Mode, ast: &Val) -> Result<bool, Exception> {
+    let mut buf = [0u8; 1];
+    match env.sym.stdin.var().val.read(&mut buf) {
+        Ok(0) => {
+            env.push(env.nil());
+            Ok(false)
+        }
+        Ok(_) => {
+            env.push((buf[0] as isize).into());
+            Ok(true)
+        }
+        Err(e) => {
+            Err(env.read_err("readb", e))
+        }
+    }
 }
-fn peek_char(env: &mut Env, mode: Mode, ast: &Val) -> Result<bool, Exception> {
-    Ok(true)
+fn peekb(env: &mut Env, mode: Mode, ast: &Val) -> Result<bool, Exception> {
+    if !env.sym.stdin.var().val.is_stream() {
+        let v = env.sym.stdin.var().val.clone();
+        return Err(env.type_err("peekb", &v, "stream"));
+    }
+    match env.sym.stdin.var().val.stream().peek() {
+        Ok(b) => {
+            env.push((b as isize).into());
+            Ok(true)
+        }
+        Err(ParseErr::TokenEnd)|Err(ParseErr::Eof) => {
+            env.push(env.nil());
+            Ok(false)
+        }
+        Err(ParseErr::Read(e)) => {
+            Err(env.read_err("peekb", e))
+        }
+        Err(_) => {
+            panic!()
+        }
+    }
 }
 fn read_atom(env: &mut Env, mode: Mode, ast: &Val) -> Result<bool, Exception> {
     Ok(true)
 }
 fn echo(env: &mut Env, mode: Mode, ast: &Val) -> Result<bool, Exception> {
+    let old_stack_len = env.eval_args(ast)?;
+    let arg_n = env.arg_stack.len() - old_stack_len;
+    if arg_n == 0 {
+        return Ok(true);
+    }
+    let tmp = env.sym.ifs.var().val.clone();
+    let ifs = tmp.to_path()
+        .or_else(|v|Err(env.type_err("echo", &tmp, "symbol or string or number")))?;
+
+    for _ in 0..arg_n {
+        env.rest_stack.push(env.arg_stack.pop().unwrap());
+    }
+    let path = Cow::<Path>::try_from(env.rest_stack.pop().unwrap())
+        .or_else(|v|Err(env.type_err("echo", &v, "symbol or string or number")))?;
+    env.sym.stdin.var().val.write(path.as_os_str().as_encoded_bytes());
+    for _ in 1..arg_n {
+        let path = Cow::<Path>::try_from(env.rest_stack.pop().unwrap())
+            .or_else(|v|Err(env.type_err("echo", &v, "symbol or string or number")))?;
+        env.sym.stdin.var().val.write(ifs.as_os_str().as_encoded_bytes());
+        env.sym.stdin.var().val.write(path.as_os_str().as_encoded_bytes());
+    }
+    env.sym.stdin.var().val.write(b"\n");
+    env.push(env.nil());
+
     Ok(true)
 }
 fn printf(env: &mut Env, mode: Mode, ast: &Val) -> Result<bool, Exception> {
     Ok(true)
 }
 fn pipe(env: &mut Env, mode: Mode, ast: &Val) -> Result<bool, Exception> {
-    Ok(true)
+    match std::io::pipe() {
+        Ok((r, w)) => {
+            env.push(Val::new_piper(r));
+            env.push(Val::new_pipew(w));
+            env.stack_to_list(mode,  env.arg_stack.len() - 2);
+            Ok(true)
+        }
+        Err(e) => {
+            Err(env.other_err(env.sym.syscall_err.clone(),
+            format!("pipe: failed to create pipe: detail={}", e)))
+        }
+    }
 }
 fn buf(env: &mut Env, _: Mode, ast: &Val) -> Result<bool, Exception> {
     let old_stack_len = env.eval_args(ast)?;
-    for i in old_stack_len - 1..env.arg_stack.len() {
-        let mut val = std::mem::replace(&mut env.arg_stack[i], ZERO);
+    if env.arg_stack.len() - old_stack_len != 1 {
+        return Err(env.argument_err("buf", env.arg_stack.len() - old_stack_len, "1"));
+    }
+    let mut val = env.arg_stack.pop().unwrap();
+    env.arg_stack.push(
         if val.is_file() {
-            env.arg_stack[i] = Val::new_stream(Box::new(Stream::new(BufReader::new(val.move_file()))));
+            Val::new_stream(Box::new(Stream::new(BufReader::new(val.move_file()))))
+        } else if val.is_piper() {
+            Val::new_stream(Box::new(Stream::new(BufReader::new(val.move_piper()))))
         } else if val == env.sym.stdin {
-            env.arg_stack[i] = Val::new_stream(Box::new(Stream::new(BufReader::new(io::stdin()))));
+            Val::new_stream(Box::new(Stream::new(BufReader::new(io::stdin()))))
         } else {
             return Err(env.type_err("buf", &val, "fd"));
         }
-    }
+    );
     Ok(true)
 }
 fn open(env: &mut Env, _: Mode, ast: &Val) -> Result<bool, Exception> {
     let old_stack_len = env.eval_args(ast)?;
-    for i in old_stack_len - 1..env.arg_stack.len() {
-        let mut val = std::mem::replace(&mut env.arg_stack[i], ZERO);
+    if env.arg_stack.len() - old_stack_len > 1 {
+        return Err(env.argument_err("open", env.arg_stack.len() - old_stack_len, "0 or 1"));
+    }
+    if old_stack_len == env.arg_stack.len() {
+        //todo
+    } else {
+        let val = env.arg_stack.pop().unwrap();
         let path = val.to_path()
             .or_else(|_|Err(env.type_err("open", &val, "symbol or string or number")))?;
         match OpenOptions::new().read(true).write(true).create(true).open(&path) {
             Ok(f) => {
-                env.arg_stack[i] = Val::new_file(f);
+                env.arg_stack.push(Val::new_file(f));
             }
             Err(e) => {
-                return Err(env.other_err(env.sym.io_err.clone(),
-                format!("open: failed to open {}: error code: {}", path.display(), e)));
+                return Err(env.other_err(env.sym.syscall_err.clone(),
+                format!("open: failed to open {}: detail={}", path.display(), e)));
             }
         }
     }
