@@ -937,96 +937,406 @@ S式を評価する。
 (is-chars (chars "hello"))                    ; => success
 (is-chars "hello")                            ; => failure
 ```
-- **is-file**: /todo/
-- **is-atom**: /todo/
+
+#### is-file
+
+**Usage**: `is-file value`  
+**Takes**: `any`  
+**Returns**: `boolean`
+
+**Description**:
+値がfileオブジェクトかどうかを判定する。
+
+**Examples**:
+```lisp
+(is-file (open "test.txt"))                   ; => success
+(is-file STDOUT)                              ; => success
+(is-file "hello")                             ; => failure
+```
+
+#### is-atom
+
+**Usage**: `is-atom value`  
+**Takes**: `any`  
+**Returns**: `boolean`
+
+**Description**:
+値がアトム（cellではない値）かどうかを判定する。数値、文字列、シンボル、変数、ファイル、辞書などはアトムとして扱われる。
+
+**Examples**:
+```lisp
+(is-atom 123)                                 ; => success
+(is-atom "hello")                             ; => success
+(is-atom 'symbol)                             ; => success
+(is-atom (cons 1 2))                          ; => failure
+(is-atom nil)                                 ; => success
+```
 
 ### リスト操作
 
 #### cons
-`(cons a b) → (a . b)`
 
-- `(cons)` は `(cons () ())`
-- `(cons a)` は `(cons a ())`  
-- `(cons a b c)` は `(cons a (cons b c))` と等価
+**Usage**: `cons [car [cdr]]`  
+**Takes**: `[any [any]]`  
+**Returns**: `cell`
+
+**Description**:
+cellを構築する。引数が0個の場合は `(cons nil nil)` と等価。引数が1個の場合は `(cons car nil)` と等価。引数が3個以上の場合は `(cons a (cons b c))` のように右結合で展開される。
+
+**Examples**:
+```lisp
+(cons 1 2)                                    ; => (1 . 2)
+(cons 1)                                      ; => (1 . nil)
+(cons)                                        ; => (nil . nil)
+(cons 1 2 3)                                  ; => (1 . (2 . 3))
+```
 
 #### head
-リストの先頭を返す。
+
+**Usage**: `head list`  
+**Takes**: `cell`  
+**Returns**: `any`
+
+**Description**:
+リストの先頭要素（car部）を返す。引数がnilの場合はnilを返す。引数がcellでない場合は例外を発生させる。
+
+**Examples**:
+```lisp
+(head (cons 1 2))                             ; => 1
+(head (cons "a" (cons "b" nil)))              ; => "a"
+(head nil)                                    ; => nil
+(head 123)                                    ; => error
+```
 
 #### rest
-リストのcdr部を返す。
+
+**Usage**: `rest list`  
+**Takes**: `cell`  
+**Returns**: `any`
+
+**Description**:
+リストの残り部分（cdr部）を返す。引数がnilの場合はnilを返す。引数がcellでない場合は例外を発生させる。
+
+**Examples**:
+```lisp
+(rest (cons 1 2))                             ; => 2
+(rest (cons "a" (cons "b" nil)))              ; => ("b" . nil)
+(rest nil)                                    ; => nil
+(rest 123)                                    ; => error
+```
 
 ### 辞書操作
 
 #### dict
-新しい辞書を作成。`(dict key1 val1 key2 val2...)`
+
+**Usage**: `dict [key value]...`  
+**Takes**: `[any any]...`  
+**Returns**: `dict`
+
+**Description**:
+新しい辞書を作成する。引数は key value のペアで指定する。引数の個数が奇数の場合は例外を発生させる。
+
+**Examples**:
+```lisp
+(dict)                                        ; => {}
+(dict "name" "Alice" "age" 30)                ; => {"name": "Alice", "age": 30}
+(dict 1 "one" 2 "two")                        ; => {1: "one", 2: "two"}
+```
 
 #### del
-辞書から要素を削除。
+
+**Usage**: `del dict key`  
+**Takes**: `dict any`  
+**Returns**: `dict`
+
+**Description**:
+辞書から指定されたキーを削除する。キーが存在しない場合は元の辞書をそのまま返す。元の辞書は変更されず、新しい辞書が返される。
+
+**Examples**:
+```lisp
+(del (dict "a" 1 "b" 2) "a")                 ; => {"b": 2}
+(del (dict "a" 1) "c")                       ; => {"a": 1}
+```
+
+#### keys
+
+**Usage**: `keys dict`  
+**Takes**: `dict`  
+**Returns**: `cell`
+
+**Description**:
+辞書のすべてのキーを線形リストで返す。キーの順序は保証されない。
+
+**Examples**:
+```lisp
+(keys (dict "a" 1 "b" 2))                    ; => ("a" "b") or ("b" "a")
+(keys (dict))                                 ; => nil
+```
 
 ### 文字列操作
 
 #### split
+
+**Usage**: `split string [regex [count]]`  
+**Takes**: `string [string [number]]`  
+**Returns**: `cell`
+
+**Description**:
+文字列を区切り文字（正規表現）で分割する。regexが省略された場合は文字コードのリストを返す。countは最大分割数の上限。
+
+**Examples**:
 ```lisp
-(split string [regex [count]])
+(split "a,b,c" ",")                          ; => ("a" "b" "c")
+(split "hello")                              ; => (104 101 108 108 111)
+(split "a,b,c,d" "," 2)                      ; => ("a" "b,c,d")
 ```
 
-区切り文字(正規表現)で分割する。countは最大の分割の上限、regexが省略された場合は文字コードのリストを返す。
-
 #### expand
-文字列結合、パス名展開、リストの組み合わせ列挙を行う。
 
+**Usage**: `expand value...`  
+**Takes**: `any...`  
+**Returns**: `string` or `cell`
+
+**Description**:
+文字列結合、パス名展開、リストの組み合わせ列挙を行う。引数にglobが含まれる場合は多値を返す可能性がある。
+
+**Examples**:
 ```lisp
-(expand a b c) -> 'abc'
-(expand a (glob *)) -> a.txt a.img
-(expand `(a b) 1 `(c d)) -> (a1c a1d b1c b1d)
+(expand "a" "b" "c")                         ; => "abc"
+(expand "a" (glob "*"))                      ; => "a.txt" "a.img" (if *.txt, *.img exist)
+(expand (cons "a" (cons "b" nil)) 1 
+        (cons "c" (cons "d" nil)))           ; => ("a1c" "a1d" "b1c" "b1d")
 ```
 
 #### str
+
+**Usage**: `str code...`  
+**Takes**: `number...`  
+**Returns**: `string`
+
+**Description**:
 文字コードを表す数値を結合した文字列を生成する。
+
+**Examples**:
+```lisp
+(str 65 66 67)                               ; => "ABC"
+(str 72 101 108 108 111)                     ; => "Hello"
+(str)                                        ; => ""
+```
 
 ### 入出力
 
 #### read-line
-STDINに設定されたオブジェクトがfileかbufferedの場合に1行読み取り。その他の場合はエラー。
+
+**Usage**: `read-line [input]`  
+**Takes**: `[file|buffered]`  
+**Returns**: `string`
+
+**Description**:
+STDINまたは指定されたオブジェクトから1行読み取る。改行文字は含まれない。EOFの場合はnilを返す。
+
+**Examples**:
+```lisp
+(read-line)                                  ; => reads from STDIN
+(read-line (open "test.txt"))                ; => reads from file
+```
 
 #### parse
-STDINに設定されたオブジェクトがcharsの場合にS式をパース。その他の場合はエラー。
+
+**Usage**: `parse [input]`  
+**Takes**: `[chars]`  
+**Returns**: `any`
+
+**Description**:
+STDINまたは指定されたcharsオブジェクトからS式をパースして返す。パースエラーの場合は例外を発生させる。
+
+**Examples**:
+```lisp
+(parse (chars "(+ 1 2)"))                   ; => (+ 1 2)
+(parse (chars "123"))                        ; => 123
+```
 
 #### cur-line
-STDINに設定されたオブジェクトがcharsの場合に現在の行位置を返す。その他の場合はエラー。
+
+**Usage**: `cur-line [input]`  
+**Takes**: `[chars]`  
+**Returns**: `number`
+
+**Description**:
+STDINまたは指定されたcharsオブジェクトの現在の行位置を返す（1ベース）。
+
+**Examples**:
+```lisp
+(cur-line (chars "line1\nline2"))            ; => 1 (initially)
+```
 
 #### peekc
-STDINに設定されたオブジェクトがcharsの場合に次の文字を参照し返す。その他の場合はエラー。
+
+**Usage**: `peekc [input]`  
+**Takes**: `[chars]`  
+**Returns**: `number`
+
+**Description**:
+STDINまたは指定されたcharsオブジェクトから次の文字を参照して文字コードを返す。読み取り位置は進まない。EOFの場合は-1を返す。
+
+**Examples**:
+```lisp
+(peekc (chars "ABC"))                        ; => 65 (character 'A')
+```
 
 #### readb
-STDINに設定されたオブジェクトがfileかbufferedの場合に1byte読み取って数値を返す。その他の場合はエラー。
+
+**Usage**: `readb [input]`  
+**Takes**: `[file|buffered]`  
+**Returns**: `number`
+
+**Description**:
+STDINまたは指定されたオブジェクトから1バイト読み取って数値を返す。EOFの場合は-1を返す。
+
+**Examples**:
+```lisp
+(readb)                                      ; => reads byte from STDIN
+(readb (open "binary.dat"))                  ; => reads from file
+```
 
 #### readc
-STDINに設定されたオブジェクトがcharsの場合に1文字読み取って文字コードを返す。その他の場合はエラー。
+
+**Usage**: `readc [input]`  
+**Takes**: `[chars]`  
+**Returns**: `number`
+
+**Description**:
+STDINまたは指定されたcharsオブジェクトから1文字読み取って文字コードを返す。読み取り位置が進む。EOFの場合は-1を返す。
+
+**Examples**:
+```lisp
+(readc (chars "ABC"))                        ; => 65, next readc returns 66
+```
 
 #### echo
-STDINに設定されたオブジェクトに文字列を出力し、改行する。引数間にはIFSに設定された値を挟み込む。
+
+**Usage**: `echo [value...] [> output]`  
+**Takes**: `[any...] [file|buffered]`  
+**Returns**: `nil`
+
+**Description**:
+STDOUTまたは指定されたオブジェクトに値を文字列変換して出力し、改行する。引数間にはIFSに設定された値を挟み込む。
+
+**Examples**:
+```lisp
+(echo "Hello" "World")                       ; => prints "Hello World\n"
+(echo 123 456)                               ; => prints "123 456\n"
+(echo "test" > (open "output.txt" "w"))      ; => writes to file
+```
 
 #### print
-STDINに設定されたオブジェクトに文字列を出力する。引数間にはIFSに設定された値を挟み込む。
+
+**Usage**: `print [value...] [> output]`  
+**Takes**: `[any...] [file|buffered]`  
+**Returns**: `nil`
+
+**Description**:
+STDOUTまたは指定されたオブジェクトに値を文字列変換して出力する。改行は追加されない。引数間にはIFSに設定された値を挟み込む。
+
+**Examples**:
+```lisp
+(print "Hello" "World")                      ; => prints "HelloWorld" (no newline)
+(print 123 " + " 456 " = " (+ 123 456))     ; => prints "123 + 456 = 579"
+```
 
 #### show
-STDINに設定されたオブジェクトに文字列を出力する。引数のオブジェクトはすべてデバッグ用に文字列変換される。
+
+**Usage**: `show [value...] [> output]`  
+**Takes**: `[any...] [file|buffered]`  
+**Returns**: `nil`
+
+**Description**:
+STDOUTまたは指定されたオブジェクトに値をデバッグ形式で出力する。リストは S式形式、文字列はクォート付きで表示される。
+
+**Examples**:
+```lisp
+(show (cons 1 2))                            ; => prints "(1 . 2)"
+(show "hello" 123)                           ; => prints "\"hello\" 123"
+```
 
 #### pipe
+
+**Usage**: `pipe`  
+**Takes**: `()`  
+**Returns**: `cell`
+
+**Description**:
 無名パイプを生成し、読み取り用fileオブジェクトと書き込み用fileオブジェクトのリストを返す。
 
+**Examples**:
+```lisp
+(pipe)                                       ; => (read-fd . write-fd)
+(let (p (pipe))
+  (echo "test" > (cdr p))
+  (read-line (car p)))                       ; => "test"
+```
+
 #### buf
-fileまたは文字列からbufferedを生成して返す。
+
+**Usage**: `buf source`  
+**Takes**: `file|string`  
+**Returns**: `buffered`
+
+**Description**:
+fileオブジェクトまたは文字列からbufferedオブジェクトを生成して返す。バッファリングされた入出力が可能になる。
+
+**Examples**:
+```lisp
+(buf (open "test.txt"))                      ; => buffered file object
+(buf "hello world")                          ; => buffered string object
+```
 
 #### chars
-fileまたは文字列からユニコードを前提に一文字ずつとりだすためのcharsオブジェクトを生成する。
+
+**Usage**: `chars source`  
+**Takes**: `file|string`  
+**Returns**: `chars`
+
+**Description**:
+fileオブジェクトまたは文字列からcharsオブジェクトを生成する。ユニコード文字を一文字ずつ取り出すためのオブジェクト。
+
+**Examples**:
+```lisp
+(chars "Hello")                              ; => chars object for "Hello"
+(chars (open "utf8.txt"))                    ; => chars object for file
+```
 
 #### open
-ファイルを開く。引数が無い場合は一時ファイルを開いてfdを返す。
+
+**Usage**: `open [filename [mode]]`  
+**Takes**: `[string [string]]`  
+**Returns**: `file`
+
+**Description**:
+ファイルを開いてfileオブジェクトを返す。引数が無い場合は一時ファイルを作成。modeは "r"（読み取り、デフォルト）、"w"（書き込み）、"a"（追記）など。
+
+**Examples**:
+```lisp
+(open "test.txt")                            ; => opens for reading
+(open "output.txt" "w")                      ; => opens for writing
+(open)                                       ; => creates temporary file
+```
 
 #### env-var
-環境変数を参照してstringオブジェクトを生成して返す。
+
+**Usage**: `env-var name [default]`  
+**Takes**: `string [string]`  
+**Returns**: `string`
+
+**Description**:
+環境変数を参照してstringオブジェクトを生成して返す。環境変数が存在しない場合はdefaultを返す。defaultも指定されていない場合はnilを返す。
+
+**Examples**:
+```lisp
+(env-var "HOME")                             ; => "/home/user"
+(env-var "UNKNOWN_VAR" "default")            ; => "default"
+(env-var "PATH")                             ; => PATH環境変数の値
+```
 
 ### 特殊なシンボル
 
