@@ -85,7 +85,7 @@ code = command { command_operator command };
 - **数値**: 123, -321など数または#a、#\nなどの文字コード
 - **symbol**: abc, @などアルファベットと記号
 - **variable**: $abc, $@, $1など$で始まる文字列
-- **string**: "abc"などダブルクォーテーションで囲まれた文字列
+- **string**: 'abc'などシングルクォーテーションで囲まれた文字列
 - **cell**: (1 2 3), (a . b)など丸括弧とドットを用いたS式
 
 ## 非終端記号とASTの対応
@@ -98,15 +98,15 @@ code = command { command_operator command };
 | brank | N/A |
 | digit | 123 |
 | symbol | abc |
-| quoted | "abc" |
+| quoted | 'abc' |
 | variable | $abc |
 | block | (), (a b c), (do (a b c) (a b c)) |
 | glob | (glob . *) |
-| value | 123, abc, "abc", $abc, (a b c), (glob . *) |
+| value | 123, abc, 'abc', $abc, (a b c), (glob . *) |
 | operator | +, >=, \|, \|\|, ; |
 | value_operator | +, >= |
 | expr | (+ 1 2 3) |
-| values | 123, (expand 123 abc "abc" $abc (a b) (glob . *)) |
+| values | 123, (expand 123 abc 'abc' $abc (a b) (glob . *)) |
 | multi_values | (@ $x) (@ (a b c)) |
 | word | 123, (@ $x), (expand 123 abc (+ 1 2 3) (glob . *)) |
 | command | (abc 123 (@ $x) (expand 123 abc) (+ 1 2 3)) |
@@ -261,7 +261,7 @@ code = command { command_operator command };
 
 **Examples**:
 ```lisp
-(do (echo "first") (echo "second") 42)          ; => 42
+(do (echo 'first') (echo 'second') 42)          ; => 42
 (do (swap $x 1) (swap $y 2) (+ $x $y))         ; => 3
 ```
 
@@ -276,8 +276,8 @@ code = command { command_operator command };
 
 **Examples**:
 ```lisp
-(if (> 5 3) "yes" "no")                        ; => "yes"
-(if (< 5 3) "less" (> 5 3) "greater" "equal") ; => "greater"
+(if (> 5 3) 'yes' 'no')                        ; => 'yes'
+(if (< 5 3) 'less' (> 5 3) 'greater' 'equal') ; => 'greater'
 ```
 
 #### while
@@ -292,7 +292,7 @@ condが成功する限りbodyを繰り返し評価する。condが失敗した�
 **Examples**:
 ```lisp
 (while (< $i 3) (do (echo $i) (swap $i (+ $i 1)))) ; => nil
-(while (< $i 3) (echo $i) (echo "done"))           ; => nil
+(while (< $i 3) (echo $i) (echo 'done'))           ; => nil
 ```
 
 ##### break
@@ -306,7 +306,7 @@ while ループを抜ける。
 
 **Examples**:
 ```lisp
-(while 1 (if (> $i 5) (break "exit") (swap $i (+ $i 1)))) ; => exits loop
+(while 1 (if (> $i 5) (break 'exit') (swap $i (+ $i 1)))) ; => exits loop
 ```
 
 ##### continue
@@ -335,7 +335,7 @@ while ループの次の繰り返しへ。
 **Examples**:
 ```lisp
 (@ (cons 1 (cons 2 3)))                        ; => 1 2
-(echo @(cons "a" (cons "b" nil)))              ; => prints "a b"
+(echo @(cons 'a' (cons 'b' nil)))              ; => prints 'a b'
 ```
 
 #### spawn
@@ -349,7 +349,7 @@ while ループの次の繰り返しへ。
 
 **Examples**:
 ```lisp
-(spawn (echo "background"))                     ; => process-id
+(spawn (echo 'background'))                     ; => process-id
 (spawn (sleep 5))                              ; => process-id
 ```
 
@@ -425,8 +425,8 @@ S式のクォートおよび展開処理。
 
 **Examples**:
 ```lisp
-(raise error "something went wrong")           ; => throws exception
-(raise type-error "expected number")          ; => throws type exception
+(raise error 'something went wrong')           ; => throws exception
+(raise type-error 'expected number')          ; => throws type exception
 ```
 
 #### return
@@ -440,7 +440,7 @@ S式のクォートおよび展開処理。
 
 **Examples**:
 ```lisp
-(fn (x) (if (< x 0) (return "negative") (+ x 1))) ; => early return
+(fn (x) (if (< x 0) (return 'negative') (+ x 1))) ; => early return
 ```
 
 #### catch
@@ -454,8 +454,8 @@ try部を評価し、例外が上がった場合にhandlerに例外元のraise�
 
 **Examples**:
 ```lisp
-(catch (raise error "test") (fn (e msg) (echo "caught:" msg))) ; => prints "caught: test"
-(catch (+ 1 2) (echo "error"))                                ; => 3
+(catch (raise error 'test') (fn (e msg) (echo 'caught:' msg))) ; => prints 'caught: test'
+(catch (+ 1 2) (echo 'error'))                                ; => 3
 ```
 
 #### shift
@@ -543,8 +543,8 @@ try部を評価し、例外が上がった場合にhandlerに例外元のraise�
 
 **Examples**:
 ```lisp
-(trap SIGINT (echo "interrupted"))            ; => sets interrupt handler
-(trap error (echo "error occurred"))          ; => sets error handler
+(trap SIGINT (echo 'interrupted'))            ; => sets interrupt handler
+(trap error (echo 'error occurred'))          ; => sets error handler
 ```
 
 #### eval
@@ -588,7 +588,7 @@ S式を評価する。
 **Examples**:
 ```lisp
 (fail)                                         ; => nil (with failure status)
-(if (fail) "success" "failure")               ; => "failure"
+(if (fail) 'success' 'failure')               ; => 'failure'
 ```
 
 ### 算術 / 論理
@@ -669,7 +669,7 @@ S式を評価する。
 ```lisp
 (== 1 1 1)                                    ; => success
 (== 1 2)                                      ; => failure
-(== "123" 123)                                ; => success
+(== '123' 123)                                ; => success
 ```
 
 #### =
@@ -683,9 +683,9 @@ S式を評価する。
 
 **Examples**:
 ```lisp
-(= "hello" "hello")                           ; => success
-(= "a" "b")                                   ; => failure
-(= 123 "123")                                 ; => success
+(= 'hello' 'hello')                           ; => success
+(= 'a' 'b')                                   ; => failure
+(= 123 '123')                                 ; => success
 ```
 
 #### is
@@ -776,7 +776,7 @@ S式を評価する。
 **Examples**:
 ```lisp
 (not (> 1 2))                                 ; => success
-(not (= "a" "a"))                             ; => failure
+(not (= 'a' 'a'))                             ; => failure
 ```
 
 #### in
@@ -790,8 +790,8 @@ S式を評価する。
 
 **Examples**:
 ```lisp
-(in "a" (cons "a" (cons "b" (cons "c" nil)))) ; => success
-(in "d" (cons "a" (cons "b" (cons "c" nil)))) ; => failure
+(in 'a' (cons 'a' (cons 'b' (cons 'c' nil)))) ; => success
+(in 'd' (cons 'a' (cons 'b' (cons 'c' nil)))) ; => failure
 ```
 
 #### ~
@@ -805,9 +805,9 @@ S式を評価する。
 
 **Examples**:
 ```lisp
-(~ "hello" "h.*o")                            ; => success
-(~ "world" "^w")                              ; => success
-(~ "test" "xyz")                              ; => failure
+(~ 'hello' 'h.*o')                            ; => success
+(~ 'world' '^w')                              ; => success
+(~ 'test' 'xyz')                              ; => failure
 ```
 
 ### 型チェック
@@ -841,7 +841,7 @@ S式を評価する。
 ```lisp
 (is-empty nil)                                ; => success
 (is-empty 0)                                  ; => failure
-(is-empty "")                                 ; => failure
+(is-empty '')                                 ; => failure
 ```
 
 #### is-string
@@ -855,7 +855,7 @@ S式を評価する。
 
 **Examples**:
 ```lisp
-(is-string "hello")                           ; => success
+(is-string 'hello')                           ; => success
 (is-string 123)                               ; => failure
 (is-string 'symbol)                           ; => failure
 ```
@@ -872,7 +872,7 @@ S式を評価する。
 **Examples**:
 ```lisp
 (is-symbol 'hello)                            ; => success
-(is-symbol "hello")                           ; => failure
+(is-symbol 'hello')                           ; => failure
 (is-symbol 123)                               ; => failure
 ```
 
@@ -905,7 +905,7 @@ S式を評価する。
 ```lisp
 (is-number 123)                               ; => success
 (is-number -45)                               ; => success
-(is-number "123")                             ; => failure
+(is-number '123')                             ; => failure
 ```
 
 #### is-buffered
@@ -919,8 +919,8 @@ S式を評価する。
 
 **Examples**:
 ```lisp
-(is-buffered (buf "hello"))                   ; => success
-(is-buffered "hello")                         ; => failure
+(is-buffered (buf 'hello'))                   ; => success
+(is-buffered 'hello')                         ; => failure
 ```
 
 #### is-chars
@@ -934,8 +934,8 @@ S式を評価する。
 
 **Examples**:
 ```lisp
-(is-chars (chars "hello"))                    ; => success
-(is-chars "hello")                            ; => failure
+(is-chars (chars 'hello'))                    ; => success
+(is-chars 'hello')                            ; => failure
 ```
 
 #### is-file
@@ -949,9 +949,9 @@ S式を評価する。
 
 **Examples**:
 ```lisp
-(is-file (open "test.txt"))                   ; => success
+(is-file (open 'test.txt'))                   ; => success
 (is-file STDOUT)                              ; => success
-(is-file "hello")                             ; => failure
+(is-file 'hello')                             ; => failure
 ```
 
 #### is-atom
@@ -966,7 +966,7 @@ S式を評価する。
 **Examples**:
 ```lisp
 (is-atom 123)                                 ; => success
-(is-atom "hello")                             ; => success
+(is-atom 'hello')                             ; => success
 (is-atom 'symbol)                             ; => success
 (is-atom (cons 1 2))                          ; => failure
 (is-atom nil)                                 ; => success
@@ -1003,7 +1003,7 @@ cellを構築する。引数が0個の場合は `(cons nil nil)` と等価。引
 **Examples**:
 ```lisp
 (head (cons 1 2))                             ; => 1
-(head (cons "a" (cons "b" nil)))              ; => "a"
+(head (cons 'a' (cons 'b' nil)))              ; => 'a'
 (head nil)                                    ; => nil
 (head 123)                                    ; => error
 ```
@@ -1020,7 +1020,7 @@ cellを構築する。引数が0個の場合は `(cons nil nil)` と等価。引
 **Examples**:
 ```lisp
 (rest (cons 1 2))                             ; => 2
-(rest (cons "a" (cons "b" nil)))              ; => ("b" . nil)
+(rest (cons 'a' (cons 'b' nil)))              ; => ('b' . nil)
 (rest nil)                                    ; => nil
 (rest 123)                                    ; => error
 ```
@@ -1039,8 +1039,8 @@ cellを構築する。引数が0個の場合は `(cons nil nil)` と等価。引
 **Examples**:
 ```lisp
 (dict)                                        ; => {}
-(dict "name" "Alice" "age" 30)                ; => {"name": "Alice", "age": 30}
-(dict 1 "one" 2 "two")                        ; => {1: "one", 2: "two"}
+(dict 'name' 'Alice' 'age' 30)                ; => {'name': 'Alice', 'age': 30}
+(dict 1 'one' 2 'two')                        ; => {1: 'one', 2: 'two'}
 ```
 
 #### del
@@ -1054,8 +1054,8 @@ cellを構築する。引数が0個の場合は `(cons nil nil)` と等価。引
 
 **Examples**:
 ```lisp
-(del (dict "a" 1 "b" 2) "a")                 ; => {"b": 2}
-(del (dict "a" 1) "c")                       ; => {"a": 1}
+(del (dict 'a' 1 'b' 2) 'a')                 ; => {'b': 2}
+(del (dict 'a' 1) 'c')                       ; => {'a': 1}
 ```
 
 #### keys
@@ -1069,7 +1069,7 @@ cellを構築する。引数が0個の場合は `(cons nil nil)` と等価。引
 
 **Examples**:
 ```lisp
-(keys (dict "a" 1 "b" 2))                    ; => ("a" "b") or ("b" "a")
+(keys (dict 'a' 1 'b' 2))                    ; => ('a' 'b') or ('b' 'a')
 (keys (dict))                                 ; => nil
 ```
 
@@ -1086,9 +1086,9 @@ cellを構築する。引数が0個の場合は `(cons nil nil)` と等価。引
 
 **Examples**:
 ```lisp
-(split "a,b,c" ",")                          ; => ("a" "b" "c")
-(split "hello")                              ; => (104 101 108 108 111)
-(split "a,b,c,d" "," 2)                      ; => ("a" "b,c,d")
+(split 'a,b,c' ',')                          ; => ('a' 'b' 'c')
+(split 'hello')                              ; => (104 101 108 108 111)
+(split 'a,b,c,d' ',' 2)                      ; => ('a' 'b,c,d')
 ```
 
 #### expand
@@ -1102,10 +1102,10 @@ cellを構築する。引数が0個の場合は `(cons nil nil)` と等価。引
 
 **Examples**:
 ```lisp
-(expand "a" "b" "c")                         ; => "abc"
-(expand "a" (glob "*"))                      ; => "a.txt" "a.img" (if *.txt, *.img exist)
-(expand (cons "a" (cons "b" nil)) 1 
-        (cons "c" (cons "d" nil)))           ; => ("a1c" "a1d" "b1c" "b1d")
+(expand 'a' 'b' 'c')                         ; => 'abc'
+(expand 'a' (glob '*'))                      ; => 'a.txt' 'a.img' (if *.txt, *.img exist)
+(expand (cons 'a' (cons 'b' nil)) 1 
+        (cons 'c' (cons 'd' nil)))           ; => ('a1c' 'a1d' 'b1c' 'b1d')
 ```
 
 #### str
@@ -1119,9 +1119,9 @@ cellを構築する。引数が0個の場合は `(cons nil nil)` と等価。引
 
 **Examples**:
 ```lisp
-(str 65 66 67)                               ; => "ABC"
-(str 72 101 108 108 111)                     ; => "Hello"
-(str)                                        ; => ""
+(str 65 66 67)                               ; => 'ABC'
+(str 72 101 108 108 111)                     ; => 'Hello'
+(str)                                        ; => ''
 ```
 
 ### 入出力
@@ -1138,7 +1138,7 @@ STDINまたは指定されたオブジェクトから1行読み取る。改行�
 **Examples**:
 ```lisp
 (read-line)                                  ; => reads from STDIN
-(read-line (open "test.txt"))                ; => reads from file
+(read-line (open 'test.txt'))                ; => reads from file
 ```
 
 #### parse
@@ -1152,8 +1152,8 @@ STDINまたは指定されたcharsオブジェクトからS式をパースして
 
 **Examples**:
 ```lisp
-(parse (chars "(+ 1 2)"))                   ; => (+ 1 2)
-(parse (chars "123"))                        ; => 123
+(parse (chars '(+ 1 2)'))                   ; => (+ 1 2)
+(parse (chars '123'))                        ; => 123
 ```
 
 #### cur-line
@@ -1167,7 +1167,7 @@ STDINまたは指定されたcharsオブジェクトの現在の行位置を返�
 
 **Examples**:
 ```lisp
-(cur-line (chars "line1\nline2"))            ; => 1 (initially)
+(cur-line (chars 'line1\nline2'))            ; => 1 (initially)
 ```
 
 #### peekc
@@ -1181,7 +1181,7 @@ STDINまたは指定されたcharsオブジェクトから次の文字を参照�
 
 **Examples**:
 ```lisp
-(peekc (chars "ABC"))                        ; => 65 (character 'A')
+(peekc (chars 'ABC'))                        ; => 65 (character 'A')
 ```
 
 #### readb
@@ -1196,7 +1196,7 @@ STDINまたは指定されたオブジェクトから1バイト読み取って�
 **Examples**:
 ```lisp
 (readb)                                      ; => reads byte from STDIN
-(readb (open "binary.dat"))                  ; => reads from file
+(readb (open 'binary.dat'))                  ; => reads from file
 ```
 
 #### readc
@@ -1210,7 +1210,7 @@ STDINまたは指定されたcharsオブジェクトから1文字読み取って
 
 **Examples**:
 ```lisp
-(readc (chars "ABC"))                        ; => 65, next readc returns 66
+(readc (chars 'ABC'))                        ; => 65, next readc returns 66
 ```
 
 #### echo
@@ -1224,9 +1224,9 @@ STDOUTまたは指定されたオブジェクトに値を文字列変換して�
 
 **Examples**:
 ```lisp
-(echo "Hello" "World")                       ; => prints "Hello World\n"
-(echo 123 456)                               ; => prints "123 456\n"
-(echo "test" > (open "output.txt" "w"))      ; => writes to file
+(echo 'Hello' 'World')                       ; => prints 'Hello World\n'
+(echo 123 456)                               ; => prints '123 456\n'
+(echo 'test' > (open 'output.txt' 'w'))      ; => writes to file
 ```
 
 #### print
@@ -1240,8 +1240,8 @@ STDOUTまたは指定されたオブジェクトに値を文字列変換して�
 
 **Examples**:
 ```lisp
-(print "Hello" "World")                      ; => prints "HelloWorld" (no newline)
-(print 123 " + " 456 " = " (+ 123 456))     ; => prints "123 + 456 = 579"
+(print 'Hello' 'World')                      ; => prints 'HelloWorld' (no newline)
+(print 123 ' + ' 456 ' = ' (+ 123 456))     ; => prints '123 + 456 = 579'
 ```
 
 #### show
@@ -1255,8 +1255,8 @@ STDOUTまたは指定されたオブジェクトに値をデバッグ形式で�
 
 **Examples**:
 ```lisp
-(show (cons 1 2))                            ; => prints "(1 . 2)"
-(show "hello" 123)                           ; => prints "\"hello\" 123"
+(show (cons 1 2))                            ; => prints '(1 . 2)'
+(show 'hello' 123)                           ; => prints '\'hello\' 123'
 ```
 
 #### pipe
@@ -1272,8 +1272,8 @@ STDOUTまたは指定されたオブジェクトに値をデバッグ形式で�
 ```lisp
 (pipe)                                       ; => (read-fd . write-fd)
 (let (p (pipe))
-  (echo "test" > (cdr p))
-  (read-line (car p)))                       ; => "test"
+  (echo 'test' > (cdr p))
+  (read-line (car p)))                       ; => 'test'
 ```
 
 #### buf
@@ -1287,8 +1287,8 @@ fileオブジェクトまたは文字列からbufferedオブジェクトを生�
 
 **Examples**:
 ```lisp
-(buf (open "test.txt"))                      ; => buffered file object
-(buf "hello world")                          ; => buffered string object
+(buf (open 'test.txt'))                      ; => buffered file object
+(buf 'hello world')                          ; => buffered string object
 ```
 
 #### chars
@@ -1302,8 +1302,8 @@ fileオブジェクトまたは文字列からcharsオブジェクトを生成�
 
 **Examples**:
 ```lisp
-(chars "Hello")                              ; => chars object for "Hello"
-(chars (open "utf8.txt"))                    ; => chars object for file
+(chars 'Hello')                              ; => chars object for 'Hello'
+(chars (open 'utf8.txt'))                    ; => chars object for file
 ```
 
 #### open
@@ -1313,29 +1313,29 @@ fileオブジェクトまたは文字列からcharsオブジェクトを生成�
 **Returns**: `file`
 
 **Description**:
-ファイルを開いてfileオブジェクトを返す。引数が無い場合は一時ファイルを作成。modeは "r"（読み取り、デフォルト）、"w"（書き込み）、"a"（追記）など。
+ファイルを開いてfileオブジェクトを返す。引数が無い場合は一時ファイルを作成。modeは 'r'（読み取り、デフォルト）、'w'（書き込み）、'a'（追記）など。
 
 **Examples**:
 ```lisp
-(open "test.txt")                            ; => opens for reading
-(open "output.txt" "w")                      ; => opens for writing
+(open 'test.txt')                            ; => opens for reading
+(open 'output.txt' 'w')                      ; => opens for writing
 (open)                                       ; => creates temporary file
 ```
 
 #### env-var
 
-**Usage**: `env-var name [default]`  
-**Takes**: `string [string]`  
+**Usage**: `env-var name`  
+**Takes**: `string`  
 **Returns**: `string`
 
 **Description**:
-環境変数を参照してstringオブジェクトを生成して返す。環境変数が存在しない場合はdefaultを返す。defaultも指定されていない場合はnilを返す。
+環境変数を参照してstringオブジェクトを生成して返す。環境変数が存在しない場合は失敗しnilを返す。
 
 **Examples**:
 ```lisp
-(env-var "HOME")                             ; => "/home/user"
-(env-var "UNKNOWN_VAR" "default")            ; => "default"
-(env-var "PATH")                             ; => PATH環境変数の値
+(env-var 'HOME')                             ; => '/home/user'
+(env-var 'UNKNOWN_VAR' 'default')            ; => 'default'
+(env-var 'PATH')                             ; => PATH環境変数の値
 ```
 
 ### 特殊なシンボル
@@ -1377,7 +1377,7 @@ fileオブジェクトまたは文字列からcharsオブジェクトを生成�
 (def read-back-quoted ()
   (if (char #`)
       (let (result (intern (str @(while (none-of `(#`)) (collect $?)))))
-        (or (char #`) (fatal "need closing '`'"))
+        (or (char #`) (fatal 'need closing '`''))
         $result)))
 
 (swap OPERATOR-CHARS `(#; #& #| #@ #> #<))
@@ -1389,7 +1389,7 @@ fileオブジェクトまたは文字列からcharsオブジェクトを生成�
   (token SPASE)
   (if (token $op)
     (do (token NEWLINE)
-         (cons (or (parse $power) (fatal "need right expression for " $op)) (parse-right $op $power))
+         (cons (or (parse $power) (fatal 'need right expression for ' $op)) (parse-right $op $power))
     $NIL))
 
 (def parse-left (power)
@@ -1408,7 +1408,7 @@ fileオブジェクトまたは文字列からcharsオブジェクトを生成�
     (next-token))
 
 (def fatal ()
-  (raise parse-error (expand (cur-line) ": " $@)))
+  (raise parse-error (expand (cur-line) ': ' $@)))
 
 (def parse (power)
   (let (left (parse-left power))
