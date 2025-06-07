@@ -206,136 +206,737 @@ code = command { command_operator command };
 ### 特殊形式
 
 #### swap
+
+**Usage**: `swap variable value`  
+**Takes**: `variable any`  
+**Returns**: `any`
+
+**Description**:
 第一引数の値の参照元に第二引数の評価結果を設定し、元の値を返す。
 
+**Examples**:
 ```lisp
-(do (swap $a 1) (swap $a 2)) => 1
-(do (swap $a (cons 1 2)) (swap (car $a) 3) (head $a)) => 3
+(do (swap $a 1) (swap $a 2))                    ; => 1
+(do (swap $a (cons 1 2)) (swap (car $a) 3) (head $a)) ; => 3
 ```
 
 #### dynamic
-ラムダ式を構築する特殊形式の内、環境を作成しないもの。(その場で呼び出されるラムダ式を想定 (= let))
 
-`(dynamic (arg ...) body...)` はmacro-expandの延長でのスコープ解析により `(() (arg ...) body...)` に置換される。
+**Usage**: `dynamic (arg...) body...`  
+**Takes**: `(symbol...) command...`  
+**Returns**: `any`
+
+**Description**:
+ラムダ式を構築する特殊形式の内、環境を作成しないもの。その場で呼び出されるラムダ式を想定（letと等価）。macro-expandの延長でのスコープ解析により `(() (arg ...) body...)` に置換される。
+
+**Examples**:
+```lisp
+(dynamic (x y) (+ x y))                         ; => lambda without environment
+(dynamic (a) (echo a))                          ; => lambda for immediate execution
+```
 
 #### fn
-ラムダ式を構築する特殊形式の内、環境を作成するもの。
 
-`(fn (arg1 ...) body...)` はmacro-expandの延長でのスコープ解析により `(cons (env 自由変数...) (arg ...) body...)` に置換される。
+**Usage**: `fn (arg...) body...`  
+**Takes**: `(symbol...) command...`  
+**Returns**: `cell`
+
+**Description**:
+ラムダ式を構築する特殊形式の内、環境を作成するもの。macro-expandの延長でのスコープ解析により `(cons (env 自由変数...) (arg ...) body...)` に置換される。
+
+**Examples**:
+```lisp
+(fn (x) (+ x 1))                                ; => lambda with environment
+(fn (a b) (echo a b))                           ; => function taking two arguments
+```
 
 #### do
+
+**Usage**: `do expr...`  
+**Takes**: `command...`  
+**Returns**: `any`
+
+**Description**:
 引数を順に評価し、最後の結果を返す。最後の引数以外の結果は$?変数に束縛される。
 
-#### if
+**Examples**:
 ```lisp
-(if [cond then] ... [else])
+(do (echo "first") (echo "second") 42)          ; => 42
+(do (swap $x 1) (swap $y 2) (+ $x $y))         ; => 3
 ```
 
+#### if
+
+**Usage**: `if [cond then]... [else]`  
+**Takes**: `any...`  
+**Returns**: `any`
+
+**Description**:
 条件分岐。一番左のcond節が成功した場合はthen節を評価し、その結果で返る。失敗した場合は右隣のcond節then節を同様に評価し、どのcond節も失敗した場合はelse節を評価する。else節がない場合は最後のcond節の結果を返す。
 
-`(if cond1 then1 cond2 then2 else)` は `(if cond1 then1 (if cond2 then2 else))` と等価である。
-
-#### while
+**Examples**:
 ```lisp
-(while cond [body [else]])
+(if (> 5 3) "yes" "no")                        ; => "yes"
+(if (< 5 3) "less" (> 5 3) "greater" "equal") ; => "greater"
 ```
 
+#### while
+
+**Usage**: `while cond [body [else]]`  
+**Takes**: `any [command...] [command...]`  
+**Returns**: `any`
+
+**Description**:
 condが成功する限りbodyを繰り返し評価する。condが失敗した場合elseを評価する。復帰値はnil、ただしcontinueおよびbreakに引数が与えられた場合はその値を蓄積したリストを返す。
 
-- **break**: while ループを抜ける。
-- **continue**: while ループの次の繰り返しへ。
+**Examples**:
+```lisp
+(while (< $i 3) (do (echo $i) (swap $i (+ $i 1)))) ; => nil
+(while (< $i 3) (echo $i) (echo "done"))           ; => nil
+```
+
+##### break
+
+**Usage**: `break [value]`  
+**Takes**: `[any]`  
+**Returns**: `never`
+
+**Description**:
+while ループを抜ける。
+
+**Examples**:
+```lisp
+(while 1 (if (> $i 5) (break "exit") (swap $i (+ $i 1)))) ; => exits loop
+```
+
+##### continue
+
+**Usage**: `continue [value]`  
+**Takes**: `[any]`  
+**Returns**: `never`
+
+**Description**:
+while ループの次の繰り返しへ。
+
+**Examples**:
+```lisp
+(while (< $i 10) (if (== (% $i 2) 0) (continue) (echo $i))) ; => prints odd numbers
+```
 
 #### @
+
+**Usage**: `@ expr`  
+**Takes**: `any`  
+**Returns**: `any...`
+
+**Description**:
 可変長引数展開。`(@ $args)` は $argsの要素を展開。ただし、@はインターンされないため、`@(...)`または`@`(...)`、`@$var`の形でのみ呼び出すことができる。
 
+**Examples**:
+```lisp
+(@ (cons 1 (cons 2 3)))                        ; => 1 2
+(echo @(cons "a" (cons "b" nil)))              ; => prints "a b"
+```
+
 #### spawn
-非同期プロセスの起動。`(spawn (code...))` プロセスIDを返す。
+
+**Usage**: `spawn (code...)`  
+**Takes**: `(command...)`  
+**Returns**: `number`
+
+**Description**:
+非同期プロセスの起動。プロセスIDを返す。
+
+**Examples**:
+```lisp
+(spawn (echo "background"))                     ; => process-id
+(spawn (sleep 5))                              ; => process-id
+```
 
 #### quote
+
+**Usage**: `quote expr`  
+**Takes**: `any`  
+**Returns**: `any`
+
+**Description**:
 引数のリストを評価せずに返す。
 
-#### back-quote, unquote
+**Examples**:
+```lisp
+(quote (+ 1 2))                                ; => (+ 1 2)
+'(a b c)                                       ; => (a b c)
+```
+
+#### back-quote
+
+**Usage**: `back-quote expr`  
+**Takes**: `any`  
+**Returns**: `any`
+
+**Description**:
 S式のクォートおよび展開処理。
+
+**Examples**:
+```lisp
+`(+ 1 ,(+ 2 3))                               ; => (+ 1 5)
+`(list ,@(cons 1 (cons 2 nil)))               ; => (list 1 2)
+```
 
 ### その他制御
 
 #### func
+
+**Usage**: `func symbol`  
+**Takes**: `symbol`  
+**Returns**: `any`
+
+**Description**:
 シンボルが束縛されている関数オブジェクトを返す。
 
+**Examples**:
+```lisp
+(func +)                                       ; => function object for +
+(func echo)                                    ; => function object for echo
+```
+
 #### env
+
+**Usage**: `env symbol...`  
+**Takes**: `symbol...`  
+**Returns**: `cell`
+
+**Description**:
 引数に指定されたシンボルに束縛された値を参照型に変換、シンボルを変数に変換し、`(参照型 variable 参照型 variable...)` のリストを返す。この時シンボルに参照型をセットする。
 
+**Examples**:
+```lisp
+(env x y)                                      ; => (ref($x) $x ref($y) $y)
+```
+
 #### raise
-例外を発生させる。`(raise symbol deatil)`
+
+**Usage**: `raise symbol detail`  
+**Takes**: `symbol any`  
+**Returns**: `never`
+
+**Description**:
+例外を発生させる。
+
+**Examples**:
+```lisp
+(raise error "something went wrong")           ; => throws exception
+(raise type-error "expected number")          ; => throws type exception
+```
 
 #### return
-関数・マクロからの即時リターン。`(return value)`
+
+**Usage**: `return value`  
+**Takes**: `any`  
+**Returns**: `never`
+
+**Description**:
+関数・マクロからの即時リターン。
+
+**Examples**:
+```lisp
+(fn (x) (if (< x 0) (return "negative") (+ x 1))) ; => early return
+```
 
 #### catch
-```lisp
-(catch try handler)
-```
 
+**Usage**: `catch try handler`  
+**Takes**: `command command`  
+**Returns**: `any`
+
+**Description**:
 try部を評価し、例外が上がった場合にhandlerに例外元のraiseの引数を渡して評価する。
 
-#### shift
+**Examples**:
 ```lisp
-(shift [number])
+(catch (raise error "test") (fn (e msg) (echo "caught:" msg))) ; => prints "caught: test"
+(catch (+ 1 2) (echo "error"))                                ; => 3
 ```
 
+#### shift
+
+**Usage**: `shift [number]`  
+**Takes**: `[number]`  
+**Returns**: `any`
+
+**Description**:
 束縛されなかった引数の内number(デフォルト1)番目の引数を返す。束縛されなかった引数のうち、n番目の引数を n - number 番目に変更する。number番目の引数がない場合は失敗する。
 
-#### arg, argc
-位置パラメタ$nは`(arg n)`にパースされる。引数が無い場合は束縛されなかった引数を線形リストにして返す。$@は`@(arg)`と等価である。$#は`(argc)`にパースされる。
-
-#### wait
+**Examples**:
 ```lisp
-(wait [pid])
+(shift)                                        ; => first unbound argument
+(shift 2)                                      ; => second unbound argument
 ```
 
+#### arg
+
+**Usage**: `arg [n]`  
+**Takes**: `[number]`  
+**Returns**: `any`
+
+**Description**:
+位置パラメタ$nは`(arg n)`にパースされる。引数が無い場合は束縛されなかった引数を線形リストにして返す。
+
+**Examples**:
+```lisp
+(arg 1)                                        ; => first argument
+(arg)                                          ; => list of all unbound arguments
+```
+
+#### argc
+
+**Usage**: `argc`  
+**Takes**: `()`  
+**Returns**: `number`
+
+**Description**:
+束縛されなかった引数の個数を返す。$#は`(argc)`にパースされる。
+
+**Examples**:
+```lisp
+(argc)                                         ; => number of unbound arguments
+```
+
+#### wait
+
+**Usage**: `wait [pid]`  
+**Takes**: `[number]`  
+**Returns**: `number`
+
+**Description**:
 プロセスの終了を待機する。pidがない場合はspawnが生成したすべてのプロセスを待機。
 
+**Examples**:
+```lisp
+(wait 1234)                                    ; => wait for specific process
+(wait)                                         ; => wait for all spawned processes
+```
+
 #### gensym
+
+**Usage**: `gensym`  
+**Takes**: `()`  
+**Returns**: `symbol`
+
+**Description**:
 一意なシンボルを生成する。
 
+**Examples**:
+```lisp
+(gensym)                                       ; => #:G001
+(gensym)                                       ; => #:G002
+```
+
 #### trap
+
+**Usage**: `trap signal handler`  
+**Takes**: `symbol command`  
+**Returns**: `any`
+
+**Description**:
 シグナルやエラーに対するハンドラを定義する。
 
+**Examples**:
+```lisp
+(trap SIGINT (echo "interrupted"))            ; => sets interrupt handler
+(trap error (echo "error occurred"))          ; => sets error handler
+```
+
 #### eval
-S式を評価。
+
+**Usage**: `eval expr`  
+**Takes**: `any`  
+**Returns**: `any`
+
+**Description**:
+S式を評価する。
+
+**Examples**:
+```lisp
+(eval '(+ 1 2))                               ; => 3
+(eval (cons + (cons 1 (cons 2 nil))))        ; => 3
+```
 
 #### macro-expand
+
+**Usage**: `macro-expand expr`  
+**Takes**: `any`  
+**Returns**: `any`
+
+**Description**:
 マクロ展開の結果を返す。
 
+**Examples**:
+```lisp
+(macro-expand '(when (> x 0) (echo x)))       ; => (if (> x 0) (echo x))
+```
+
 #### fail
-ステータス失敗を返す
+
+**Usage**: `fail`  
+**Takes**: `()`  
+**Returns**: `nil`
+
+**Description**:
+ステータス失敗を返す。
+
+**Examples**:
+```lisp
+(fail)                                         ; => nil (with failure status)
+(if (fail) "success" "failure")               ; => "failure"
+```
 
 ### 算術 / 論理
 
-#### 不定個の引数を取るもの
+#### +
 
-- **+, -, *, /**: 加減乗除
-- **==**: 数値と解釈した場合の同値性
-- **=**: 文字と解釈した場合の同値性
-- **is**: オブジェクトの同一性
-- **<, <=, >, >=**: 大小比較
+**Usage**: `+ number...`  
+**Takes**: `number...`  
+**Returns**: `number`
 
-#### 定数個の引数を取るもの
+**Description**:
+数値の加算を行う。引数が0個の場合は0を返す。
 
-- **not**: 成否を反転する
-- **in**: 集合内包含。`(in a (a b c))`
-- **~**: 正規表現マッチ
+**Examples**:
+```lisp
+(+ 1 2 3)                                     ; => 6
+(+ 10 -5)                                     ; => 5
+(+)                                           ; => 0
+```
+
+#### -
+
+**Usage**: `- number...`  
+**Takes**: `number...`  
+**Returns**: `number`
+
+**Description**:
+数値の減算を行う。引数が1個の場合は符号反転。
+
+**Examples**:
+```lisp
+(- 10 3 2)                                    ; => 5
+(- 5)                                         ; => -5
+```
+
+#### *
+
+**Usage**: `* number...`  
+**Takes**: `number...`  
+**Returns**: `number`
+
+**Description**:
+数値の乗算を行う。引数が0個の場合は1を返す。
+
+**Examples**:
+```lisp
+(* 2 3 4)                                     ; => 24
+(* 5 -2)                                      ; => -10
+(*)                                           ; => 1
+```
+
+#### /
+
+**Usage**: `/ number...`  
+**Takes**: `number...`  
+**Returns**: `number`
+
+**Description**:
+数値の除算を行う。ゼロ除算の場合は例外を発生させる。
+
+**Examples**:
+```lisp
+(/ 12 3 2)                                    ; => 2
+(/ 10 2)                                      ; => 5
+(/ 1 0)                                       ; => error
+```
+
+#### ==
+
+**Usage**: `== value...`  
+**Takes**: `any...`  
+**Returns**: `boolean`
+
+**Description**:
+数値と解釈した場合の同値性を判定する。
+
+**Examples**:
+```lisp
+(== 1 1 1)                                    ; => success
+(== 1 2)                                      ; => failure
+(== "123" 123)                                ; => success
+```
+
+#### =
+
+**Usage**: `= value...`  
+**Takes**: `any...`  
+**Returns**: `boolean`
+
+**Description**:
+文字列と解釈した場合の同値性を判定する。
+
+**Examples**:
+```lisp
+(= "hello" "hello")                           ; => success
+(= "a" "b")                                   ; => failure
+(= 123 "123")                                 ; => success
+```
+
+#### is
+
+**Usage**: `is value value`  
+**Takes**: `any any`  
+**Returns**: `boolean`
+
+**Description**:
+オブジェクトの同一性を判定する。
+
+**Examples**:
+```lisp
+(is $x $x)                                    ; => success
+(is 1 1)                                      ; => success
+(is (cons 1 2) (cons 1 2))                   ; => failure
+```
+
+#### <
+
+**Usage**: `< number...`  
+**Takes**: `number...`  
+**Returns**: `boolean`
+
+**Description**:
+数値の大小比較（小なり）を行う。
+
+**Examples**:
+```lisp
+(< 1 2 3)                                     ; => success
+(< 1 3 2)                                     ; => failure
+```
+
+#### <=
+
+**Usage**: `<= number...`  
+**Takes**: `number...`  
+**Returns**: `boolean`
+
+**Description**:
+数値の大小比較（小なりイコール）を行う。
+
+**Examples**:
+```lisp
+(<= 1 2 2)                                    ; => success
+(<= 2 1)                                      ; => failure
+```
+
+#### >
+
+**Usage**: `> number...`  
+**Takes**: `number...`  
+**Returns**: `boolean`
+
+**Description**:
+数値の大小比較（大なり）を行う。
+
+**Examples**:
+```lisp
+(> 3 2 1)                                     ; => success
+(> 1 2)                                       ; => failure
+```
+
+#### >=
+
+**Usage**: `>= number...`  
+**Takes**: `number...`  
+**Returns**: `boolean`
+
+**Description**:
+数値の大小比較（大なりイコール）を行う。
+
+**Examples**:
+```lisp
+(>= 3 2 2)                                    ; => success
+(>= 1 2)                                      ; => failure
+```
+
+#### not
+
+**Usage**: `not expr`  
+**Takes**: `any`  
+**Returns**: `boolean`
+
+**Description**:
+成否を反転する。
+
+**Examples**:
+```lisp
+(not (> 1 2))                                 ; => success
+(not (= "a" "a"))                             ; => failure
+```
+
+#### in
+
+**Usage**: `in value list`  
+**Takes**: `any cell`  
+**Returns**: `boolean`
+
+**Description**:
+集合内包含を判定する。
+
+**Examples**:
+```lisp
+(in "a" (cons "a" (cons "b" (cons "c" nil)))) ; => success
+(in "d" (cons "a" (cons "b" (cons "c" nil)))) ; => failure
+```
+
+#### ~
+
+**Usage**: `~ string regex`  
+**Takes**: `string string`  
+**Returns**: `boolean`
+
+**Description**:
+正規表現マッチを行う。
+
+**Examples**:
+```lisp
+(~ "hello" "h.*o")                            ; => success
+(~ "world" "^w")                              ; => success
+(~ "test" "xyz")                              ; => failure
+```
 
 ### 型チェック
 
-- **is-list**: /todo/
-- **is-empty**: /todo/
-- **is-string**: /todo/
-- **is-symbol**: /todo/
-- **is-variable**: /todo/
-- **is-number**: /todo/
-- **is-buffered**: /todo/
-- **is-chars**: /todo/
+#### is-list
+
+**Usage**: `is-list value`  
+**Takes**: `any`  
+**Returns**: `boolean`
+
+**Description**:
+値がリスト（cell）かどうかを判定する。
+
+**Examples**:
+```lisp
+(is-list (cons 1 2))                          ; => success
+(is-list 123)                                 ; => failure
+(is-list nil)                                 ; => success
+```
+
+#### is-empty
+
+**Usage**: `is-empty value`  
+**Takes**: `any`  
+**Returns**: `boolean`
+
+**Description**:
+値が空（nil）かどうかを判定する。
+
+**Examples**:
+```lisp
+(is-empty nil)                                ; => success
+(is-empty 0)                                  ; => failure
+(is-empty "")                                 ; => failure
+```
+
+#### is-string
+
+**Usage**: `is-string value`  
+**Takes**: `any`  
+**Returns**: `boolean`
+
+**Description**:
+値が文字列かどうかを判定する。
+
+**Examples**:
+```lisp
+(is-string "hello")                           ; => success
+(is-string 123)                               ; => failure
+(is-string 'symbol)                           ; => failure
+```
+
+#### is-symbol
+
+**Usage**: `is-symbol value`  
+**Takes**: `any`  
+**Returns**: `boolean`
+
+**Description**:
+値がシンボルかどうかを判定する。
+
+**Examples**:
+```lisp
+(is-symbol 'hello)                            ; => success
+(is-symbol "hello")                           ; => failure
+(is-symbol 123)                               ; => failure
+```
+
+#### is-variable
+
+**Usage**: `is-variable value`  
+**Takes**: `any`  
+**Returns**: `boolean`
+
+**Description**:
+値が変数かどうかを判定する。
+
+**Examples**:
+```lisp
+(is-variable $x)                              ; => success
+(is-variable 'x)                              ; => failure
+(is-variable 123)                             ; => failure
+```
+
+#### is-number
+
+**Usage**: `is-number value`  
+**Takes**: `any`  
+**Returns**: `boolean`
+
+**Description**:
+値が数値かどうかを判定する。
+
+**Examples**:
+```lisp
+(is-number 123)                               ; => success
+(is-number -45)                               ; => success
+(is-number "123")                             ; => failure
+```
+
+#### is-buffered
+
+**Usage**: `is-buffered value`  
+**Takes**: `any`  
+**Returns**: `boolean`
+
+**Description**:
+値がbufferedオブジェクトかどうかを判定する。
+
+**Examples**:
+```lisp
+(is-buffered (buf "hello"))                   ; => success
+(is-buffered "hello")                         ; => failure
+```
+
+#### is-chars
+
+**Usage**: `is-chars value`  
+**Takes**: `any`  
+**Returns**: `boolean`
+
+**Description**:
+値がcharsオブジェクトかどうかを判定する。
+
+**Examples**:
+```lisp
+(is-chars (chars "hello"))                    ; => success
+(is-chars "hello")                            ; => failure
+```
 - **is-file**: /todo/
 - **is-atom**: /todo/
 
