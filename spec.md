@@ -1025,6 +1025,23 @@ cellを構築する。引数が0個の場合は `(cons nil nil)` と等価。引
 (rest 123)                                    ; => error
 ```
 
+#### each
+
+**Usage**: `each symbol collection body`  
+**Takes**: `cell`  
+**Returns**: `any`
+
+**Description**:
+リストの残り部分（cdr部）を返す。引数がnilの場合はnilを返す。引数がcellでない場合は例外を発生させる。
+
+**Examples**:
+```lisp
+(rest (cons 1 2))                             ; => 2
+(rest (cons 'a' (cons 'b' nil)))              ; => ('b' . nil)
+(rest nil)                                    ; => nil
+(rest 123)                                    ; => error
+```
+
 ### 辞書操作
 
 #### dict
