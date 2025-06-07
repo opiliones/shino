@@ -1,23 +1,26 @@
 use std::fmt;
 use std::ptr;
+use std::env;
 use std::borrow::Cow;
 use std::cell::{Cell, OnceCell, RefCell};
-use std::collections::{HashMap, VecDeque};
+use std::collections::{HashMap, HashSet, VecDeque};
 use std::fs::{File, OpenOptions, read};
 use std::os::fd::AsRawFd;
-use std::io::{BufRead, BufReader, ErrorKind};
-use std::io::{self, Read, Write, PipeWriter, PipeReader};
+use std::io::{self, Read, Write, PipeWriter, PipeReader, BufRead, BufReader, ErrorKind, Cursor};
 use std::process::{Command, Stdio, exit};
 use std::sync::atomic::{AtomicUsize, Ordering};
 use std::path::{Path, PathBuf};
 use std::os::unix::ffi::OsStringExt;
 use std::os::fd::{FromRawFd, RawFd};
 use std::ffi::OsString;
+use std::str::Chars;
+use std::iter::Peekable;
 
 use regex::Regex;
 extern crate libc;
-use libc::{fork, waitpid, pid_t};
+use libc::{fork, waitpid, pid_t, WIFEXITED, WEXITSTATUS};
 use glob::{glob, Pattern};
+use tempfile::tempfile;
 
 union Val {
     id: usize,
@@ -30,14 +33,39 @@ union Val {
     mem: *mut Mem,
 }
 #[derive (PartialEq, Copy, Clone)]
-enum Mode {Single, Multi, Set, None}
+enum Mode {Single, Multi, DoMulti, Set, DoSet, None}
+impl Mode {
+    #[inline(always)]
+    fn for_special_form(self) -> Self {
+        if self == Mode::None {
+            Mode::Single
+        } else {
+            self
+        }
+    }
+    fn for_progn(self) -> Self {
+        match self {
+            Mode::Multi => Mode::DoMulti,
+            Mode::Set => Mode::DoSet,
+            _ => Mode::Single
+        }
+    }
+    fn for_return(self) -> Self {
+        match self {
+            Mode::DoMulti => Mode::Multi,
+            Mode::DoSet => Mode::Set,
+            _ => Mode::Single
+        }
+    }
+}
+
 type Primitive = fn(&mut Env, Mode, &Val) -> Result<bool, Exception>;
 const TAG_MASK: usize = 31;
-const SYM: usize = 0;
+const VAR: usize = 0;
 const NUM: usize = 1;
 const FUNC: usize = 2;
 const CELL: usize = 8;
-const VAR: usize = 16;
+const SYM: usize = 16;
 const FAT: usize = 24;
 
 impl Val {
@@ -131,13 +159,30 @@ impl Val {
         }
     }
     #[inline(always)]
-    fn is_stream (&self) -> bool {
+    fn is_buf (&self) -> bool {
         unsafe {
             match self.id & TAG_MASK {
                 FAT => {
                     let fat = self.copy().remove_tag(FAT);
                     let result = match &(*fat.fat).val {
-                        Fat::Stream(_) => true,
+                        Fat::Buf(_) => true,
+                        _ => false
+                    };
+                    std::mem::forget(fat);
+                    result
+                }
+                _ => false
+            }
+        }
+    }
+    #[inline(always)]
+    fn is_chars (&self) -> bool {
+        unsafe {
+            match self.id & TAG_MASK {
+                FAT => {
+                    let fat = self.copy().remove_tag(FAT);
+                    let result = match &(*fat.fat).val {
+                        Fat::Chars(_) => true,
                         _ => false
                     };
                     std::mem::forget(fat);
@@ -172,23 +217,6 @@ impl Val {
                     let fat = self.copy().remove_tag(FAT);
                     let result = match &(*fat.fat).val {
                         Fat::Dict(_) => true,
-                        _ => false
-                    };
-                    std::mem::forget(fat);
-                    result
-                }
-                _ => false
-            }
-        }
-    }
-    #[inline(always)]
-    fn is_fd (&self) -> bool {
-        unsafe {
-            match self.id & TAG_MASK {
-                FAT => {
-                    let fat = self.copy().remove_tag(FAT);
-                    let result = match &(*fat.fat).val {
-                        Fat::Fd(_) => true,
                         _ => false
                     };
                     std::mem::forget(fat);
@@ -321,75 +349,35 @@ impl Val {
             }
         }
     }
-    fn new_file(file: File) -> Val {
-        unsafe {
-            let result = Val::new();
-            let tmp = std::mem::replace(&mut (*result.fat).val, Fat::File(Box::new(file)));
-            std::mem::forget(tmp);
-            (*result.fat).count = 1;
-            result.add_tag(FAT)
-        }
-    }
-    fn new_fd(fd: usize) -> Val {
-        unsafe {
-            let result = Val::new();
-            let tmp = std::mem::replace(&mut (*result.fat).val, Fat::Fd(fd));
-            std::mem::forget(tmp);
-            (*result.fat).count = 1;
-            result.add_tag(FAT)
-        }
-    }
-    fn new_piper(r: PipeReader) -> Val {
-        unsafe {
-            let result = Val::new();
-            let tmp = std::mem::replace(&mut (*result.fat).val, Fat::PipeR(Box::new(r)));
-            std::mem::forget(tmp);
-            (*result.fat).count = 1;
-            result.add_tag(FAT)
-        }
-    }
-    fn new_pipew(w: PipeWriter) -> Val {
-        unsafe {
-            let result = Val::new();
-            let tmp = std::mem::replace(&mut (*result.fat).val, Fat::PipeW(Box::new(w)));
-            std::mem::forget(tmp);
-            (*result.fat).count = 1;
-            result.add_tag(FAT)
-        }
-    }
-    fn new_stream(strm: Box<dyn StreamAPI>) -> Val {
-        unsafe {
-            let result = Val::new();
-            let tmp = std::mem::replace(&mut (*result.fat).val, Fat::Stream(strm));
-            std::mem::forget(tmp);
-            (*result.fat).count = 1;
-            result.add_tag(FAT)
-        }
-    }
-    fn new_dict() -> Val {
-        unsafe {
-            let result = Val::new();
-            let tmp = std::mem::replace(&mut (*result.fat).val, Fat::Dict(Box::new(HashMap::new())));
-            std::mem::forget(tmp);
-            (*result.fat).count = 1;
-            result.add_tag(FAT)
+    fn fat_type_of(fat: &Fat) -> &'static str {
+        match fat {
+            Fat::Buf(_) => "buffered",
+            Fat::Chars(_) => "characters",
+            Fat::Captured(x) => x.type_of(),
+            Fat::Float(_) => "float",
+            Fat::File(_) => "file",
+            Fat::PipeR(_) => "pipe",
+            Fat::PipeW(_) => "pipe",
+            Fat::Dict(_) => "dictionary",
+            Fat::Nothing => "none",
         }
     }
     fn type_of(&self) -> &'static str {
         unsafe {
             match self.id & TAG_MASK {
-                0 => {
+                VAR => {
                     if self.var().val.id == self.id {
                         "string"
                     } else {
                         "variable"
                     }
                 }
-                8 => "list",
-                16 => "symbol",
+                CELL => "list",
+                SYM => "symbol",
+                FAT => Self::fat_type_of(self.fat()),
                 _ => {
                     if self.id & 1 == 1 {
-                        "number"
+                        "integer"
                     } else {
                         "primitive"
                     }
@@ -465,12 +453,22 @@ impl Val {
         }
     }
     #[inline(always)]
-    fn stream(&mut self) -> &mut dyn StreamAPI {
-        if !self.is_stream() {
+    fn buf(&mut self) -> &mut dyn BufRead {
+        if !self.is_buf() {
             panic!();
         }
         match self.fat() {
-            Fat::Stream(x) => x.as_mut(),
+            Fat::Buf(x) => x.as_mut(),
+            _ => panic!()
+        }
+    }
+    #[inline(always)]
+    fn chars(&mut self) -> &mut dyn CharsAPI {
+        if !self.is_chars() {
+            panic!();
+        }
+        match self.fat() {
+            Fat::Chars(x) => x.as_mut(),
             _ => panic!()
         }
     }
@@ -543,13 +541,7 @@ impl Val {
         }
     }
     fn to_stdio(&self, env: &mut Env) -> Result<Stdio, Exception> {
-        if self == &env.sym.stdout {
-            Ok(Stdio::from(io::stdout()))
-        } else if self == &env.sym.stderr {
-            Ok(Stdio::from(io::stderr()))
-        } else if self == &env.sym.stdin {
-            Ok(Stdio::inherit())
-        } else if self.is_file() {
+        if self.is_file() {
             Ok(Stdio::from(self.clone_file()))
         } else if self.is_piper() {
             Ok(Stdio::from(self.clone_piper()))
@@ -567,18 +559,6 @@ impl Val {
         unsafe {
             match self.fat() {
                 Fat::Captured(x) => x,
-                _ => panic!()
-            }
-        }
-    }
-    #[inline(always)]
-    fn fd(&self) -> &mut usize {
-        if !self.is_fd() {
-            panic!();
-        }
-        unsafe {
-            match self.fat() {
-                Fat::Fd(x) => x,
                 _ => panic!()
             }
         }
@@ -629,22 +609,7 @@ impl Val {
     fn read_until(&mut self, byte: u8, buf: &mut Vec<u8>) -> Result<usize, std::io::Error> {
         let mut len = 0;
         let mut buffer = [0u8; 1];
-        if self.is_fd() {
-            match self.fd() {
-                0 => {
-                    loop {
-                        let l = std::io::stdin().read(&mut buffer)?;
-                        if l == 0 || buffer[0] == byte {
-                            return Ok(len);
-                        } else {
-                            len += l;
-                            buf.push(buffer[0]);
-                        }
-                    }
-                }
-                _ => Ok(0)
-            }
-        } else if self.is_file() {
+        if self.is_file() {
             let file = self.file();
             loop {
                 let l = file.read(&mut buffer)?;
@@ -655,8 +620,12 @@ impl Val {
                     buf.push(buffer[0]);
                 }
             }
-        } else if self.is_stream() {
-            self.stream().read_until(byte, buf)
+        } else if self.is_buf() {
+            let result = self.buf().read_until(byte, buf);
+            if buf.len() > 0 && buf.last().unwrap() == &byte {
+                let _ = buf.pop();
+            }
+            result
         } else if self.is_piper() {
             let pipe = self.piper();
             loop {
@@ -672,12 +641,39 @@ impl Val {
             Ok(0)
         }
     }
+    fn new_buf(buf: Box<dyn BufRead>) -> Val {
+        unsafe {
+            let result = Val::new();
+            let tmp = std::mem::replace(&mut (*result.fat).val, Fat::Buf(buf));
+            std::mem::forget(tmp);
+            (*result.fat).count = 1;
+            result.add_tag(FAT)
+        }
+    }
+    fn new_chars(chars: Box<dyn CharsAPI>) -> Val {
+        unsafe {
+            let result = Val::new();
+            let tmp = std::mem::replace(&mut (*result.fat).val, Fat::Chars(chars));
+            std::mem::forget(tmp);
+            (*result.fat).count = 1;
+            result.add_tag(FAT)
+        }
+    }
+    fn new_dict() -> Val {
+        unsafe {
+            let result = Val::new();
+            let tmp = std::mem::replace(&mut (*result.fat).val, Fat::Dict(Box::new(HashMap::new())));
+            std::mem::forget(tmp);
+            (*result.fat).count = 1;
+            result.add_tag(FAT)
+        }
+    }
 }
 
 impl From<isize> for Val {
     #[inline(always)]
     fn from(n: isize) -> Self {
-        Val{num: n<<1 + 1}
+        Val{num: (n<<1) + 1}
     }
 }
 impl From<f64> for Val {
@@ -686,6 +682,48 @@ impl From<f64> for Val {
         unsafe {
             let result = Val::new();
             let tmp = std::mem::replace(&mut (*result.fat).val, Fat::Float(f));
+            std::mem::forget(tmp);
+            (*result.fat).count = 1;
+            result.add_tag(FAT)
+        }
+    }
+}
+impl From<RawFd> for Val {
+    #[inline(always)]
+    fn from(fd: RawFd) -> Self {
+        let mut file1 = unsafe { File::from_raw_fd(fd) };
+        let mut file2 = file1.try_clone().unwrap();
+        std::mem::forget(file1);
+        file2.into()
+    }
+}
+impl From<File> for Val {
+    fn from(file: File) -> Self {
+        unsafe {
+            let result = Val::new();
+            let tmp = std::mem::replace(&mut (*result.fat).val, Fat::File(Box::new(file)));
+            std::mem::forget(tmp);
+            (*result.fat).count = 1;
+            result.add_tag(FAT)
+        }
+    }
+}
+impl From<PipeReader> for Val {
+    fn from(r: PipeReader) -> Self {
+        unsafe {
+            let result = Val::new();
+            let tmp = std::mem::replace(&mut (*result.fat).val, Fat::PipeR(Box::new(r)));
+            std::mem::forget(tmp);
+            (*result.fat).count = 1;
+            result.add_tag(FAT)
+        }
+    }
+}
+impl From<PipeWriter> for Val {
+    fn from(w: PipeWriter) -> Self {
+        unsafe {
+            let result = Val::new();
+            let tmp = std::mem::replace(&mut (*result.fat).val, Fat::PipeW(Box::new(w)));
             std::mem::forget(tmp);
             (*result.fat).count = 1;
             result.add_tag(FAT)
@@ -761,7 +799,10 @@ impl TryFrom<&Val> for Cow<'_, str> {
                 SYM => (*(*val.var).name).to_string_lossy(),
                 VAR => (*(*val.sym).name).to_string_lossy(),
                 CELL => return Err(()),
-                FAT if !val.is_float() => return Err(()),
+                FAT => match val.fat() {
+                    Fat::Buf(_)|Fat::Chars(_)|Fat::Dict(_)|Fat::Nothing  => return Err(()),
+                    _ => Cow::Owned(format!("{}", val)),
+                }
                 _ => Cow::Owned(format!("{}", val)),
             }
         })
@@ -773,10 +814,13 @@ impl TryFrom<&Val> for Cow<'_, Path> {
     fn try_from<'a>(val: &'a Val) -> Result<Self, Self::Error> {
         Ok(unsafe {
             match val.id & TAG_MASK {
-                SYM => Cow::Borrowed(&*(*val.var).name),
-                VAR => Cow::Borrowed(&*(*val.sym).name),
+                VAR => Cow::Borrowed(&*(*val.var).name),
+                SYM => Cow::Borrowed(&*(*val.sym).name),
                 CELL => return Err(()),
-                FAT if !val.is_float() => return Err(()),
+                FAT => match val.fat() {
+                    Fat::Buf(_)|Fat::Chars(_)|Fat::Dict(_)|Fat::Nothing  => return Err(()),
+                    _ => Cow::Owned(format!("{}", val).into()),
+                }
                 _ => Cow::Owned(format!("{}", val).into()),
             }
         })
@@ -828,12 +872,12 @@ impl fmt::Display for Val {
                     write!(f, "({}", self.car())?;
                     let mut cell = self;
                     loop {
-                        cell = self.cdr();
+                        cell = cell.cdr();
                         if cell.is_nil() {
                             break;
                         }
                         if !cell.is_cell() {
-                            write!(f, " ^ {}", cell)?;
+                            write!(f, " & {}", cell)?;
                             break;
                         }
                         write!(f, " {}", cell.car())?;
@@ -848,11 +892,11 @@ impl fmt::Display for Val {
                     let result = match tmp.fat() {
                         Fat::Captured(val) => write!(f, "{}", val),
                         Fat::Float(r) => write!(f, "{}", r),
-                        Fat::Stream(x) => write!(f, "Stream"),
+                        Fat::Buf(x) => write!(f, "Buffered"),
+                        Fat::Chars(x) => write!(f, "Chars"),
                         Fat::File(x) => write!(f, "{}", x.as_raw_fd()),
                         Fat::PipeR(x) => write!(f, "{}", x.as_raw_fd()),
                         Fat::PipeW(x) => write!(f, "{}", x.as_raw_fd()),
-                        Fat::Fd(x) => write!(f, "{}", x),
                         Fat::Dict(x) => write!(f, "Dictionary"),
                         Fat::Nothing => write!(f, "Nothing"),
                     };
@@ -977,23 +1021,12 @@ impl Drop for Val {
 
 impl std::io::Read for Val {
     fn read(&mut self, buf: &mut [u8]) -> Result<usize, std::io::Error> {
-        if self.is_fd() {
-            match self.fd() {
-                0 => std::io::stdin().read(buf),
-                _ => Ok(0)
-            }
-        } else if self.is_num() {
-            let fd = self.int().unwrap() as RawFd;
-            let mut file = unsafe { File::from_raw_fd(fd) };
-            let result = file.read(buf);
-            std::mem::forget(file);
-            result
-        } else if self.is_file() {
+        if self.is_file() {
             self.file().read(buf)
         } else if self.is_piper() {
             self.piper().read(buf)
-        } else if self.is_stream() {
-            self.stream().read(buf)
+        } else if self.is_buf() {
+            self.buf().read(buf)
         } else {
             Ok(0)
         }
@@ -1002,12 +1035,7 @@ impl std::io::Read for Val {
 
 impl std::io::Write for Val {
     fn write(&mut self, buf: &[u8]) -> Result<usize, std::io::Error> {
-        if self.is_fd() {
-            match self.fd() {
-                1 => std::io::stdout().write(buf),
-                _ => Ok(0)
-            }
-        } else if self.is_file() {
+        if self.is_file() {
             self.file().write(buf)
         } else if self.is_pipew() {
             self.pipew().write(buf)
@@ -1016,12 +1044,7 @@ impl std::io::Write for Val {
         }
     }
     fn flush(&mut self) -> Result<(), std::io::Error> {
-        if self.is_fd() {
-            match self.fd() {
-                1 => std::io::stdout().flush(),
-                _ => Ok(())
-            }
-        } else if self.is_file() {
+        if self.is_file() {
             self.file().flush()
         } else if self.is_pipew() {
             self.pipew().flush()
@@ -1037,6 +1060,16 @@ struct Var {
     count: usize,
     func: Val,
     name: *mut PathBuf,
+}
+impl Var {
+    #[inline(always)]
+    fn eval(&self) -> &Val {
+        if self.val.is_captured() {
+            self.val.captured()
+        } else {
+            &self.val
+        }
+    }
 }
 
 #[repr(C)]
@@ -1055,9 +1088,9 @@ struct FatPtr {
 enum Fat {
     Captured(Val),
     Float(f64),
-    Stream(Box<dyn StreamAPI>),
+    Buf(Box<dyn BufRead>),
+    Chars(Box<dyn CharsAPI>),
     File(Box<File>),
-    Fd(usize),
     PipeR(Box<PipeReader>),
     PipeW(Box<PipeWriter>),
     Dict(Box<HashMap<PathBuf, Val>>),
@@ -1143,13 +1176,18 @@ struct Symbols {
     nil: Val,
     t: Val,
     env: Val,
-    def: Val,
+    func: Val,
+    fn_: Val,
+    dynamic: Val,
     var: Val,
     read: Val,
     swap: Val,
     arg: Val,
+    argc: Val,
     glob: Val,
     mval: Val,
+    quote: Val,
+    back_quote: Val,
     stdin: Val,
     stdout: Val,
     stderr: Val,
@@ -1162,10 +1200,13 @@ struct Symbols {
     context_err: Val,
     glob_err: Val,
     encode_err: Val,
+    parse_err: Val,
     multi_done: Val,
+    swap_done: Val,
     progn: Val,
     mac: Val,
     unquote: Val,
+    app_arg: Val,
 }
 impl Env {
     fn new(pool_size: usize, stack_size: usize) -> Env {
@@ -1174,29 +1215,97 @@ impl Env {
         let nil = "()".to_sym(ZERO, ZERO);
         nil.sym().func = nil.clone();
         let _ = NIL.with(|x| x.set(nil.clone()));
-        let _ = "if".intern_func(if_);
-        let _ = "+".intern_func(calc_fn1::<AddOp>);
 
-        let std_in  = "/dev/fd/0".to_sym(nil.clone(), nil.clone());
-        let std_out = "/dev/fd/1".to_sym(nil.clone(), nil.clone());
-        let std_err = "/dev/fd/2".to_sym(nil.clone(), nil.clone());
+        let _ = "if".intern_func(if_);
+        let _ = "while".intern_func(while_);
+        let _ = "raise".intern_func(raise);
+        let _ = "return".intern_func(return_);
+        let _ = "break".intern_func(break_);
+        let _ = "continue".intern_func(continue_);
+        let _ = "catch".intern_func(catch);
+        let _ = "shift".intern_func(shift);
+        let _ = "spawn".intern_func(spawn);
+        let _ = "collect".intern_func(collect);
+        let mval = "@".to_sym(nil.clone(), Val{func: mval}.add_tag(FUNC));
+        let _ = "gensym".intern_func(gensym);
+        let _ = "trap".intern_func(trap);
+
+        let _ = "+".intern_func(calc_fn1::<AddOp>);
+        let _ = "-".intern_func(calc_fn1::<SubOp>);
+        let _ = "*".intern_func(calc_fn1::<MulOp>);
+        let _ = "/".intern_func(calc_fn1::<DivOp>);
+        let _ = ">".intern_func(calc_fn2::<Gt>);
+        let _ = ">=".intern_func(calc_fn2::<Ge>);
+        let _ = "<".intern_func(calc_fn2::<Lt>);
+        let _ = "<=".intern_func(calc_fn2::<Le>);
+        let _ = "==".intern_func(calc_fn2::<Equal>);
+        let _ = "not".intern_func(not);
+        let _ = "=".intern_func(same);
+        let _ = "is".intern_func(is);
+        let _ = "in".intern_func(in_);
+        let _ = "~".intern_func(re);
+        let _ = "is-list".intern_func(is_list);
+        let _ = "is-string".intern_func(is_string);
+        let _ = "is-symbol".intern_func(is_symbol);
+        let _ = "is-variable".intern_func(is_variable);
+        let _ = "is-number".intern_func(is_number);
+        let _ = "is-chars".intern_func(is_chars);
+        let _ = "is-file".intern_func(is_file);
+        let _ = "is-atom".intern_func(is_atom);
+        let _ = "is-buffered".intern_func(is_buffered);
+
+        let _ = "cons".intern_func(cons_);
+        let _ = "head".intern_func(head);
+        let _ = "rest".intern_func(rest);
+
+        let _ = "dict".intern_func(dict);
+        let _ = "del".intern_func(del);
+
+        let _ = "split".intern_func(split);
+        let _ = "expand".intern_func(expand);
+        let _ = "str".intern_func(str);
+
+        let _ = "read-line".intern_func(read_line);
+        let _ = "readc".intern_func(read_char);
+        let _ = "peekc".intern_func(peek);
+        let _ = "cur-line".intern_func(cur_line);
+        let _ = "parse".intern_func(parse);
+        let _ = "echo".intern_func(echo);
+        let _ = "echo".intern_func(show);
+        let _ = "echo".intern_func(print);
+        let _ = "pipe".intern_func(pipe);
+        let _ = "buf".intern_func(buf);
+        let _ = "chars".intern_func(chars);
+        let _ = "open".intern_func(open);
+        let _ = "env-var".intern_func(getenv);
+
+        let std_in :Val = std::io::stdin().as_raw_fd().into();
+        let std_out:Val = std::io::stdout().as_raw_fd().into();
+        let std_err:Val = std::io::stderr().as_raw_fd().into();
 
         let sym = Symbols {
             t:   1.into(),
             nil: nil.clone(),
-            def: "def".intern_func(def),
+
+            swap:"swap".intern_func(swap),
+            var: "var".intern_func(var),
+            func: "func".intern_func(func),
+            dynamic: "dynamic".intern(),
+            fn_: "fn".intern(),
+            mac: "mac".intern(),
             progn: "do".intern_func(progn),
-            mac: "mac".intern_func(mac),
             env: "env".intern_func(env),
-            var: "let".intern_func(var),
+            mval,
+
             read:"read".intern_func(read_line),
-            swap:"set".intern_func(swap),
             arg: "args".intern_func(arg),
-            mval:"@".intern_func(mval),
-            glob:"glob".intern(),
-            stdin: "STDIN".intern_and_set(Val::new_fd(0), nil.clone()).remove_tag(SYM),
-            stdout:"STDOUT".intern_and_set(Val::new_fd(1), nil.clone()).remove_tag(SYM),
-            stderr:"STDERR".intern_and_set(Val::new_fd(2), nil.clone()).remove_tag(SYM),
+            argc: "argc".intern_func(argc),
+            quote: "quote".intern_func(quote),
+            back_quote: "back_quote".intern_func(back_quote),
+            glob:"glob".intern_func(glob_),
+            stdin: "STDIN".intern_and_set(std_in, nil.clone()).remove_tag(SYM),
+            stdout:"STDOUT".intern_and_set(std_out, nil.clone()).remove_tag(SYM),
+            stderr:"STDERR".intern_and_set(std_err, nil.clone()).remove_tag(SYM),
             ifs:"IFS".intern_and_set(" ".intern(), nil.clone()).remove_tag(SYM),
             type_err:"type-error".intern(),
             arg_err:"argument-error".intern(),
@@ -1206,8 +1315,11 @@ impl Env {
             context_err:"context-error".intern(),
             glob_err:"glob-error".intern(),
             encode_err:"encode-error".intern(),
+            parse_err:"parse-error".intern(),
             multi_done: "multi_done".to_sym(nil.clone(), nil.clone()),
-            unquote: "~".to_sym(nil.clone(), nil.clone()),
+            swap_done: "swap_done".to_sym(nil.clone(), nil.clone()),
+            unquote: "unquote".to_sym(nil.clone(), nil.clone()),
+            app_arg: cons(cons("@".intern(), cons(cons("args".intern(), nil.clone()), nil.clone())), nil.clone()),
         };
 
         Self {
@@ -1238,13 +1350,20 @@ impl Env {
             name, given, expect))
     }
     fn type_err(&mut self, name: &str, given: &Val, expect: &str) -> Exception {
+        self.type_err_of_type(name, given.type_of(), expect)
+    }
+    fn type_err_of_type(&mut self, name: &str, given: &str,  expect: &str) -> Exception {
         self.other_err(self.sym.type_err.clone(),
             format!("{}: mismatched types (given {}, expected {})",
-            name, given.type_of(), expect))
+            name, given, expect))
     }
     fn type_err_conv(&mut self, name: &str, given: &Val) -> Exception {
         self.other_err(self.sym.type_err.clone(),
-            format!("{}: {}: non-numeric string", name, given))
+            format!("{}: {}: non-numeric string or types", name, given))
+    }
+    fn type_err_to_str(&mut self, name: &str, given: &Val) -> Exception {
+        self.other_err(self.sym.type_err.clone(),
+            format!("{}: {}: non-displayable types", name, given.type_of()))
     }
     fn read_err(&mut self, name: &str, e: std::io::Error) -> Exception {
         self.other_err(self.sym.io_err.clone(),
@@ -1260,26 +1379,6 @@ impl Env {
     }
     fn push(&mut self, v: Val) {
         self.arg_stack.push(v);
-    }
-    #[inline(always)]
-    fn eval(&mut self, mode: Mode, ast: &Val) -> Result<bool, Exception> {
-        unsafe {
-            match ast.id & TAG_MASK {
-                VAR => {
-                    if ast.is_captured() {
-                        self.push(ast.captured().clone());
-                    } else {
-                        self.push((*ast.var).val.clone());
-                    }
-                    Ok(true)
-                }
-                CELL => self.eval_list(mode, &(*ast.cell).car, &(*ast.cell).cdr),
-                _ => {
-                    self.push(Val {id: ast.id});
-                    Ok(true)
-                }
-            }
-        }
     }
     #[inline(always)]
     fn eval_args(&mut self, ast: &Val) -> Result<usize, Exception> {
@@ -1298,11 +1397,17 @@ impl Env {
         for _ in old_stack_len..self.arg_stack.len() {
             let v = self.arg_stack.pop().unwrap();
             let s = v.to_path()
-                .or_else(|_|Err(self.type_err("shino", &v, "symbol or string or number")))?;
+                .or_else(|_|Err(self.type_err_to_str("shino", &v)))?;
             command.arg(&*s);
         }
 
-        command.output();
+        let std_in = self.sym.stdin.var().val.clone();
+        let std_out = self.sym.stdout.var().val.clone();
+        let std_err = self.sym.stderr.var().val.clone();
+
+        command.stdin(std_in.to_stdio(self)?)
+            .stdout(std_out.to_stdio(self)?)
+            .stderr(std_err.to_stdio(self)?).output();
         match command.status() {
             Ok(status) => {
                 match status.code() {
@@ -1362,18 +1467,20 @@ impl Env {
         }
     }
     #[inline(always)]
-    fn leave_first_arg_or_nil(&mut self, stack_idx: usize) {
+    fn leave_last_arg_or_nil(&mut self, stack_idx: usize) {
         if self.arg_stack.len() == stack_idx {
             self.push(self.nil());
-        } else {
-            self.arg_stack.truncate(stack_idx + 1);
+        } else if self.arg_stack.len() > stack_idx + 1 {
+            let result = self.arg_stack.pop().unwrap();
+            self.arg_stack.truncate(stack_idx);
+            self.push(result);
         }
     }
     #[inline(always)]
     fn eval_lambda(&mut self, mode: Mode, fenv: &Val, vers: &Val, body: &Val, args: &Val) 
     -> Result<bool, Exception> {
         let old_arg_stack_len = self.arg_stack.len();
-        let old_rest_stack_len = self.rest_stack.len();
+        self.old_rest_stack_len = self.rest_stack.len();
 
         let mut args = args;
         while args.is_cell() {
@@ -1450,66 +1557,255 @@ impl Env {
             }
         }
 
-        self.rest_stack.truncate(old_rest_stack_len);
+        self.rest_stack.truncate(self.old_rest_stack_len);
 
         result
+    }
+    #[inline(always)]
+    fn app(&mut self, mode: Mode, old_stack_len: usize) -> Result<bool, Exception> {
+        if old_stack_len == self.arg_stack.len() {
+            self.push(self.nil());
+            return Ok(true);
+        }
+        self.old_rest_stack_len = self.rest_stack.len();
+        for _ in old_stack_len + 1..self.arg_stack.len() {
+            self.rest_stack.push(self.arg_stack.pop().unwrap());
+        }
+        let f = self.arg_stack.pop().unwrap();
+        self.eval_evaled_cmd(mode, &f, &self.sym.app_arg.clone())
+    }
+    #[inline(always)]
+    fn dict_lookup(&mut self, mode: Mode, d: &mut Box<HashMap<PathBuf, Val>>, arg_len: usize) 
+        -> Result<bool, Exception> 
+    {
+        if arg_len == 0 {
+            return Err(self.argument_err("swap", 0, "1 or more"));
+        }
+        let v = self.arg_stack.pop().unwrap();
+        let key = v.to_path()
+            .or_else(|_|Err(self.type_err_to_str("shino", &v)))?;
+        if arg_len == 1 {
+            if mode == Mode::Set {
+                let new = std::mem::replace(&mut self.set_val, self.sym.swap_done.clone());
+                if let Some(addr) = d.get_mut(&*key) {
+                    let old = std::mem::replace(addr, new);
+                    self.push(old);
+                } else {
+                    d.insert(key.to_path_buf(), new);
+                    self.push(self.nil());
+                }
+                Ok(true)
+            } else {
+                if let Some(val) = d.get(&*key) {
+                    self.push(val.clone());
+                    Ok(true)
+                } else {
+                    self.push(self.nil());
+                    Ok(false)
+                }
+            }
+        } else {
+            if let Some(val) = d.get(&*key) {
+                if val.is_dict() {
+                    self.dict_lookup(mode, val.dict(), arg_len - 1)
+                } else {
+                    Err(self.type_err("shino", &val, "dictionary"))
+                }
+            } else {
+                Err(self.type_err_of_type("shino", "()", "dictionary"))
+            }
+        }
+    }
+    #[inline(always)]
+    fn eval_fat(&mut self, mode: Mode, val: &Val, args: &Val) -> Result<bool, Exception> {
+        if val.is_dict() {
+            let old_stack_len = self.eval_args(args)?;
+            let arg_len = self.arg_stack.len() - old_stack_len;
+            for _ in 0..arg_len {
+                self.rest_stack.push(self.arg_stack.pop().unwrap());
+            }
+            self.dict_lookup(mode, val.dict(), arg_len)
+        } else {
+            Err(self.type_err("shino", val, "evaluable value"))
+        }
+    }
+    #[inline(always)]
+    fn eval(&mut self, mode: Mode, ast: &Val) -> Result<bool, Exception> {
+        unsafe {
+            match ast.id & TAG_MASK {
+                VAR => {
+                    self.push((*ast.var).eval().clone());
+                    Ok(true)
+                }
+                CELL => self.eval_list(mode, &(*ast.cell).car, &(*ast.cell).cdr),
+                _ => {
+                    self.push(Val {id: ast.id});
+                    Ok(true)
+                }
+            }
+        }
     }
     #[inline(always)]
     fn eval_list(&mut self, mode: Mode, cmd: &Val, args: &Val) -> Result<bool, Exception> {
         unsafe{
             match cmd.id & TAG_MASK {
-                VAR => { // $cmd arg... or 'cmd' arg...
-                    let cmd = &(*cmd.var).val;
-                    match cmd.id & TAG_MASK {
-                        0 => self.eval_cmd(mode, &*(*cmd.var).name, args), // 'cmd' arg...
-                        8 => self.eval_lambda(mode, &(*cmd.cell).car, &(*((*cmd.cell).cdr.cell)).car,
-                        &(*((*cmd.cell).cdr.cell)).cdr, args), // (fn ...) arg...
-                        _ => self.eval_list(mode, cmd, args), // sym arg...
-                    }
+                // $cmd arg... or 'cmd' arg...
+                VAR => self.eval_evaled_cmd(mode, (*cmd.var).eval(), args),
+                // (expand ...) arg...
+                CELL => {
+                    let old_stack_len = self.arg_stack.len();
+                    let _ = self.eval(Mode::None, cmd)?;
+                    let _ = self.eval_args(args)?;
+                    self.app(mode, old_stack_len)
                 }
-                // { cmd ... }
-                CELL => self.eval(mode, &cmd),
-                SYM => { // sym arg...
+                // sym arg...
+                SYM => {
                     let f = &(*cmd.sym).func;
-
-                    match f.id & TAG_MASK {
-                        VAR => self.eval_cmd(mode, &*(*f.var).name, args), // fn f () 'cmd'; f arg... ?
-                        CELL => self.eval_lambda(mode, &(*f.cell).car, &(*((*f.cell).cdr.cell)).car,
-                                                &(*((*f.cell).cdr.cell)).cdr, args),
-                        SYM => {
-                            if f == &self.sym.nil {
-                                self.eval_cmd(mode, &*(*cmd.sym).name, args)
-                            } else {
-                                self.eval_list(mode, f, args)
-                            }
-                        }
-                        FAT => {
-                            Ok(false)
-                        }
-                        _ => { // built-in arg...
-                            let tmp = Val {id: f.id & !2};
-                            let primitive = tmp.func;
-                            std::mem::forget(tmp);
-                            primitive(self, mode, args)
-                        }
+                    if f == &self.sym.nil {
+                        self.eval_cmd(mode, &*(*cmd.sym).name, args)
+                    } else {
+                        self.eval_evaled_cmd(mode, f, args)
                     }
                 }
-                FAT => {
-                    Ok(false)
-                }
+                _ => self.eval_evaled_cmd(mode, cmd, args),
+            }
+        }
+    }
+    #[inline(always)]
+    fn eval_evaled_cmd(&mut self, mode: Mode, cmd: &Val, args: &Val) -> Result<bool, Exception> {
+        unsafe{
+            match cmd.id & TAG_MASK {
+                // 'cmd' arg...
+                VAR => self.eval_cmd(mode, &*(*cmd.var).name, args),
+                // (fn ...) arg...
+                CELL => self.eval_lambda(mode, &(*cmd.cell).car, &(*((*cmd.cell).cdr.cell)).car,
+                                    &(*((*cmd.cell).cdr.cell)).cdr, args),
+                SYM => self.eval_list(mode, cmd, args),
+                FAT => self.eval_fat(mode, cmd, args),
+                // built-in arg...
                 _ => {
-                    match cmd.id & 1 {
-                        1 => self.eval_cmd(mode, &PathBuf::from((cmd.num>>1).to_string()), args),
-                        _ => {
-                            let f = Val {id: cmd.id & !FUNC}.func;
-                            f(self, mode, args)
-                        }
+                    if cmd.id & 1 == 1 {
+                        self.eval_cmd(mode, &PathBuf::from((cmd.num>>1).to_string()), args)
+                    } else {
+                        let tmp = Val {id: cmd.id & !FUNC};
+                        let primitive = tmp.func;
+                        std::mem::forget(tmp);
+                        primitive(self, mode, args)
                     }
                 }
             }
         }
     }
+    fn macro_expand(&mut self, ast: &Val) -> Option<Val> {
+        if ast.is_cell() {
+            let old_stack_len = self.arg_stack.len();
+            let mut cdr = Some((ast, old_stack_len));
+            let mut xs = ast;
+            while xs.is_cell() {
+                if let Some(v) = self.macro_expand(xs.car()) {
+                    self.push(v);
+                    cdr = None;
+                } else {
+                    if cdr.is_none() {
+                        cdr = Some((xs, self.arg_stack.len()));
+                    }
+                    self.push(xs.car().clone());
+                }
+                xs = xs.cdr();
+            }
+            let f = &self.arg_stack[old_stack_len];
+            if f.is_sym() && f.sym().func.is_cell() && f.sym().func.car() == &self.sym.mac {
+                let _ = self.app(Mode::Single, old_stack_len);
+                Some(self.arg_stack.pop().unwrap())
+            } else {
+                let (tmp, l) = cdr.unwrap_or((&self.sym.nil, self.arg_stack.len()));
+                self.arg_stack.truncate(l);
+                if tmp == ast {
+                    None
+                } else {
+                    let mut result = tmp.clone();
+                    for _ in old_stack_len .. l {
+                        result = cons(self.arg_stack.pop().unwrap(), result);
+                    }
+                    Some(result)
+                }
+            }
+        } else {
+            None
+        }
+    }
+    fn scope_analyze_rest(&mut self, ast: &Val, def_vars: &mut HashMap<usize, isize>, ref_vars: &mut HashSet<usize>) -> Result<Option<Val>, Exception> {
+        Ok(if ast.is_cell() {
+            let car = self.scope_analyze(ast.car(), def_vars, ref_vars)?;
+            if let Some(cdr) = self.scope_analyze_rest(ast.cdr(), def_vars, ref_vars)? {
+                Some(cons(car.unwrap_or_else(||ast.car().clone()), cdr))
+            } else if let Some(car) = car {
+                Some(cons(car, ast.cdr().clone()))
+            } else {
+                None
+            }
+        } else if ast.is_var() {
+            ref_vars.insert(unsafe{ast.id} & SYM);
+            None
+        } else {
+            None
+        })
+    }
+    fn scope_analyze(&mut self, ast: &Val, def_vars: &mut HashMap<usize, isize>, ref_vars: &mut HashSet<usize>) -> Result<Option<Val>, Exception> {
+        if ast.is_cell() && ast.car() == &self.sym.dynamic || ast.car() == &self.sym.fn_ {
+            let name = if ast.car() == &self.sym.dynamic { "let" } else { "fn" };
+            let old_stack_len = self.arg_stack.len();
 
+            if !ast.cdr().is_cell() {
+                return Err(self.argument_err(name, 0, "1 or more"));
+            } else if !ast.cdr().car().is_cell() {
+                return Err(self.type_err(name, ast.cdr().car(), "symbol list"));
+            }
+            let args = ast.cdr().car();
+            for i in args {
+                if i.is_sym() {
+                    *def_vars.entry(unsafe{i.id}).or_insert(0) += 1;
+                } else {
+                    let name = if ast.car() == &self.sym.var { "let" } else { "fn" }; 
+                    return Err(self.type_err(name, i, "symbol"));
+                }
+            }
+
+            let result = if ast.car() == &self.sym.var {
+                Some(cons(self.sym.quote.clone(), cons(self.nil(), 
+                            self.scope_analyze_rest(ast, def_vars, ref_vars)?
+                            .unwrap_or_else(||ast.clone()))))
+            } else {
+                let mut ref_vars_next = HashSet::new();
+                let result = self.scope_analyze_rest(ast, def_vars, &mut ref_vars_next)?
+                    .unwrap_or_else(||ast.clone());
+
+                for i in args {
+                    unsafe {
+                        *def_vars.get_mut(unsafe{&i.id}).unwrap() *= -1;
+                    }
+                }
+                let mut fenv_arg = self.nil();
+                for (i, _) in def_vars.iter().filter(|(&k, &v)| v > 0 && ref_vars_next.contains(&k)) {
+                    fenv_arg = cons(Val{id:*i}, fenv_arg);
+                }
+                for i in args {
+                    unsafe {
+                        *def_vars.get_mut(unsafe{&i.id}).unwrap() *= -1;
+                    }
+                }
+                ref_vars.extend(ref_vars_next.iter());
+                Some(cons(self.sym.quote.clone(), cons(fenv_arg, result)))
+            };
+
+            for i in args {
+                *def_vars.get_mut(unsafe{&i.id}).unwrap() -= 1;
+            }
+            Ok(result)
+        } else {
+            self.scope_analyze_rest(ast, def_vars, ref_vars)
+        }
+    }
 
 }
 
@@ -1543,14 +1839,7 @@ impl ToNamedObj for PathBuf {
         }
     }
     fn to_var(self) -> Val {
-        unsafe {
-            let result = Val::new();
-            nil().init_value_of(&mut (*result.var).val);
-            nil().init_value_of(&mut (*result.var).func);
-            (*result.var).name = Box::into_raw(Box::new(self));
-            (*result.var).count = 0;
-            result
-        }
+        self.intern().remove_tag(SYM)
     }
     fn intern(self) -> Val  {
         self.intern_and_set(nil(), nil())
@@ -1571,7 +1860,7 @@ impl ToNamedObj for PathBuf {
     }
     fn intern_func(self, func: Primitive) -> Val {
         let f = Val{func: func}.add_tag(FUNC);
-        if !self.as_os_str().is_empty() {
+        if self.as_os_str().is_empty() {
             println!("{} = {:b}", self.display(), unsafe{f.id});
         }
         self.intern_and_set(nil().clone(), f)
@@ -1611,29 +1900,24 @@ fn nil() -> Val {
     NIL.with(|x|x.get().unwrap().clone())
 }
 
-struct Stream<R: std::io::Read> {
+struct PeekableReader<'a, R: std::io::Read> {
     reader: BufReader<R>,
-    buf: VecDeque<u8>,
+    iter: Peekable<Chars<'a>>,
+    buf: String,
     line: usize
 }
 #[derive(Debug)]
 enum ParseErr {
-    TokenEnd,
-    Eof,
     Read(std::io::Error),
-    InvalidUniCode(usize, u8),
     Syntax(usize, char),
     Other(usize, String),
 }
-const NAME: &str = "valve";
+
+const NAME: &str = "shino";
 impl fmt::Display for ParseErr {
     fn fmt(&self, f: &mut fmt::Formatter) -> fmt::Result {
         match self {
-            ParseErr::Eof => write!(f, "EOF"),
-            ParseErr::TokenEnd => write!(f, "token end"),
             ParseErr::Read(e) => write!(f, "{}: read error, {}", NAME, e),
-            ParseErr::InvalidUniCode(line, n) =>
-                write!(f, "{}: line {}: invalid unicode character {}", NAME, line, n),
             ParseErr::Syntax(line, given) =>
                 write!(f, "{}: line {}: syntax error near unexpected token `{}'", NAME, line, given),
             ParseErr::Other(line, msg) =>
@@ -1641,104 +1925,343 @@ impl fmt::Display for ParseErr {
         }
     }
 }
-trait StreamAPI {
-    fn peek(&mut self) -> Result<u8, ParseErr>;
-    fn restore(&mut self, c: u8);
-    fn read(&mut self, buf: &mut [u8]) -> Result<usize, std::io::Error>;
-    fn byte(&mut self, c: u8) -> Result<u8, ParseErr>;
-    fn read_until(&mut self, byte: u8, buf: &mut Vec<u8>) -> Result<usize, std::io::Error>;
+type Parsed<T> = Result<Option<T>, ParseErr>;
+impl<'a, R: std::io::Read> PeekableReader<'a, R> {
+    fn new(reader: R) -> Self {
+        Self {
+            reader: BufReader::new(reader), buf: "".to_string(),
+            iter: "".chars().peekable(), line: 1
+        }
+    }
+    fn syntax_err<T>(&mut self) -> Parsed<T> {
+        match self.peek() {
+            Ok(Some(c)) => Err(ParseErr::Syntax(self.line, c)),
+            Ok(None) => Err(ParseErr::Other(self.line, "unexpected EOF".to_string())),
+            Err(e) => Err(e)
+        }
+    }
+    fn update(&mut self) -> Parsed<()> {
+        self.buf.clear();
+        let result = self.reader.read_line(&mut self.buf);
+        match result {
+            Ok(0) => {
+                Ok(None)
+            }
+            Ok(_) => {
+                let chars = unsafe {
+                    std::mem::transmute::<Chars<'_>, Chars<'static>>(
+                        self.buf.chars()
+                    )
+                };
+                self.iter = chars.peekable();
+                Ok(Some(()))
+            }
+            Err(e) => Err(ParseErr::Read(e))
+        }
+    }
 }
-impl<R: std::io::Read> StreamAPI for Stream<R> {
-    fn peek(&mut self) -> Result<u8, ParseErr> {
-        if self.buf.is_empty() {
-            let mut buf = [0u8; 1];
-            loop {
-                match self.read_with_block(&mut buf) {
-                    Ok(1) => {
-                        self.buf.push_back(buf[0]);
-                        break Ok(buf[0]);
+trait CharsAPI {
+    fn peek(&mut self) -> Parsed<char>;
+    fn next(&mut self) -> Parsed<char>;
+    fn skip_if(&mut self, cond: fn(char)->bool);
+    fn parse(&mut self, env: &Env) -> Parsed<Val>;
+    fn parse_list(&mut self, env: &Env) -> Parsed<Val>;
+    fn line(&self) -> usize;
+}
+impl<'a, R: std::io::Read> CharsAPI for PeekableReader<'a, R> {
+    fn line(&self) -> usize {
+        self.line
+    }
+    fn peek(&mut self) -> Parsed<char> {
+        match self.iter.peek().cloned() {
+            Some(c) => {
+                Ok(Some(c))
+            }
+            _ => {
+                match self.update() {
+                    Ok(None) => Ok(None),
+                    Ok(Some(())) => {
+                        self.peek()
                     }
-                    Ok(_) => {
-                        break Err(ParseErr::Eof);
-                    }
-                    Err(ref e) if e.kind() == ErrorKind::Interrupted  => {}
-                    Err(e)  => {
-                        break Err(ParseErr::Read(e));
-                    }
+                    Err(e) => Err(e)
                 }
             }
-        } else {
-            unsafe {
-                Ok(*self.buf.front().unwrap_unchecked())
-            }
         }
     }
-    fn restore(&mut self, c: u8) {
-        self.buf.push_front(c);
-    }
-    fn read(&mut self, buf: &mut [u8]) -> Result<usize, std::io::Error> {
-        let len = self.buf.len().min(buf.len());
-        for i in 0..len {
-            unsafe {
-                buf[i] = self.buf.pop_front().unwrap_unchecked();
-            }
-        }
-        if len < buf.len() {
-            Ok(len + self.read_with_block(&mut buf[len..])?)
-        } else {
-            Ok(len)
-        }
-    }
-    fn byte(&mut self, c: u8) -> Result<u8, ParseErr> {
-        if c == self.peek()? {
-            self.any_byte()
-        } else {
-            Err(ParseErr::TokenEnd)
-        }
-    }
-    fn read_until(&mut self, byte: u8, buf: &mut Vec<u8>) -> Result<usize, std::io::Error> {
-        if self.buf.is_empty() {
-            return self.reader.read_until(byte, buf);
-        }
-        let mut len = 0;
-        for i in &self.buf {
-            if i == &byte {
-                for _ in 0..len {
-                    buf.push(unsafe{self.buf.pop_front().unwrap_unchecked()});
+    fn next(&mut self) -> Parsed<char> {
+        match self.iter.next() {
+            Some(c) => {
+                if c == '\n' {
+                    self.line += 1;
                 }
-                return Ok(len);
+                Ok(Some(c))
             }
-            len += 1;
+            _ => {
+                match self.update() {
+                    Ok(_) => self.next(),
+                    Ok(None) => Ok(None),
+                    Err(e) => Err(e)
+                }
+            }
         }
-        let tmp = vec![];
-        len += self.reader.read_until(byte, buf)?;
-        buf.extend(&self.buf).extend(tmp);
-        Ok(len)
+    }
+    fn skip_if(&mut self, cond: fn(char)->bool) {
+        loop {
+            match self.peek() {
+                Ok(Some(c)) if cond(c) => {}
+                _ => break
+            }
+            let _ = self.next();
+        }
+    }
+    fn parse_list(&mut self, env: &Env) -> Parsed<Val> {
+        self.skip_if(|c|c.is_ascii_whitespace());
+        match self.parse(env)? {
+            Some(car) => Ok(Some(cons(car, self.parse_list(env)?.unwrap()))),
+            _ => {
+                match self.peek()? {
+                    Some(c) if c == '&' => {
+                        let _ = self.next();
+                        self.skip_if(|c|c.is_ascii_whitespace());
+                        self.parse(env)
+                    }
+                    _ => Ok(Some(env.nil()))
+                }
+            }
+        }
+    }
+    fn parse(&mut self, env: &Env) -> Parsed<Val> {
+        let c = match self.peek()? {
+            Some(c) => c, _ => return Ok(None)
+        };
+
+        match c {
+            ';' => {
+                self.skip_if(|c|c != '\n');
+                self.parse(env)
+            }
+            '#' => {
+                let _ = self.next();
+                match self.peek()? {
+                    Some(c) if c == '\\' => {
+                        let _ = self.next();
+                        let Some(c) = self.next()? else {
+                            return Err(ParseErr::Other(self.line, "unexpected EOF".to_string()));
+                        };
+                        let c = match c {
+                            'n' => '\n',
+                            'r' => '\r',
+                            't' => '\t',
+                            's' => ' ',
+                            _ => c
+                        };
+                        Ok(Some((c as isize).into()))
+                    }
+                    Some(c) => Ok(Some((c as isize).into())),
+                    _ => Err(ParseErr::Other(self.line, "unexpected EOF".to_string()))
+                }
+            }
+            '$' => {
+                let _ = self.next();
+                let mut name = "".to_string();
+                loop {
+                    let Some(c) = self.peek()? else {
+                        break;
+                    };
+                    if name.is_empty() {
+                        match c {
+                            '@' => {
+                                return Ok(Some(cons(env.sym.mval.clone(), 
+                                            cons(env.sym.arg.clone(), env.nil()))));
+                            }
+                            '#'=> {
+                                return Ok(Some(cons(env.sym.argc.clone(), env.nil())));
+                            }
+                            _ => {}
+                        }
+                    }
+                    if c.is_ascii_whitespace() || c.is_ascii_control() {
+                        break;
+                    }
+                    if c.is_ascii_punctuation() {
+                        match c {
+                            '-'|'_' => {}
+                            _ => break
+                        }
+                    }
+                    name.push(c);
+                    let _ = self.next();
+                }
+                if name.is_empty() {
+                    return self.parse_list(env);
+                }
+                if let Ok(Some(c)) = self.peek() {
+                    if c == '^' {
+                        let _ = self.next();
+                    }
+                }
+                if let Ok(n) = name.parse::<isize>() {
+                    return Ok(Some(cons(env.sym.arg.clone(), cons(n.into(), env.nil()))));
+                }
+                Ok(Some(name.to_var()))
+            }
+            '\'' => {
+                let _ = self.next();
+                let mut quoted = "".to_string();
+                loop {
+                    let Some(c) = self.next()? else {
+                        return Err(ParseErr::Other(self.line, "unexpected EOF".to_string()));
+                    };
+                    if c == '\'' {
+                        let Some(c) = self.peek()? else {
+                            break;
+                        };
+                        if c == '\'' {
+                            quoted.push(c);
+                            let _ = self.next();
+                        } else {
+                            break;
+                        }
+                    }
+                    quoted.push(c);
+                }
+                Ok(Some(quoted.to_str()))
+            }
+            '(' => {
+                let _ = self.next();
+                let result = self.parse_list(env);
+                self.skip_if(|c|c.is_ascii_whitespace());
+                match self.peek()? {
+                    Some(c) if c == ')' => {
+                        let _ = self.next();
+                        result
+                    }
+                    _ => self.syntax_err(),
+                }
+            }
+            '`' => {
+                let _ = self.next();
+                match self.parse(env)? {
+                    Some(val) => Ok(Some(cons(env.sym.quote.clone(), val))),
+                    _ => return self.syntax_err()
+                }
+            }
+            '^' => {
+                let _ = self.next();
+                match self.parse(env)? {
+                    Some(val) => Ok(Some(cons(env.sym.back_quote.clone(), val))),
+                    _ => return self.syntax_err()
+                }
+            }
+            '~' => {
+                let _ = self.next();
+                match self.parse(env)? {
+                    Some(val) => Ok(Some(cons(env.sym.unquote.clone(), val))),
+                    _ => return self.syntax_err()
+                }
+            }
+            '?'|'*' => {
+                let _ = self.next();
+                Ok(Some(cons(env.sym.glob.clone(), c.to_string().intern())))
+            }
+            '[' => {
+                let _ = self.next();
+                let mut glob = "[".to_string();
+                loop {
+                    let Some(c) = self.next()? else {
+                        return Err(ParseErr::Other(self.line, "unexpected EOF".to_string()));
+                    };
+                    if c == ']' && glob.len() != 1 {
+                        glob.push(c);
+                        break;
+                    }
+                    glob.push(c);
+                }
+                Ok(Some(cons(env.sym.glob.clone(), glob.intern())))
+            }
+            '@' => {
+                let _ = self.next();
+                match self.parse(env)? {
+                    Some(val) => Ok(Some(cons(env.sym.mval.clone(), cons(val, env.nil())))),
+                    _ => Ok(Some("@".intern()))
+                }
+            }
+            ')'|'|'|'&'|'{'|'}'|'>'|'<'|' '|'\t'|'\n'|'\r' => {
+                Ok(None)
+            }
+            _ => {
+                let mut name = "".to_string();
+                loop {
+                    let Some(c) = self.peek()? else {
+                        break;
+                    };
+                    match c {
+                        _ if c.is_ascii_whitespace() => break,
+                        '#'|'$'|'\''|'('|';'|'`'|'^'|'~'|'?'|'*'|'['|')'|'|'|'&'|'{'|'}'|'>'|'<' => {
+                            break;
+                        }
+                        '\\' => {
+                            let _ = self.next();
+                            let Some(c) = self.peek()? else {
+                                return Err(ParseErr::Other(self.line, "unexpected EOF".to_string()));
+                            };
+                            match c {
+                                'n' => name.push('\n'),
+                                'r' => name.push('\r'),
+                                't' => name.push('\t'),
+                                '\n' => {}
+                                '0'..'9' => {
+                                    let mut n = c.to_string();
+                                    while self.next()?.is_some() {
+                                        let Some(c) = self.peek()? else {
+                                            break;
+                                        };
+                                        match c {
+                                            '0'..'9' => n.push(c),
+                                            _ => break
+                                        }
+                                    }
+                                    let code = u32::from_str_radix(&n, 8).unwrap();
+                                    name.push(std::char::from_u32(code as u32).unwrap());
+                                    continue;
+                                }
+                                _ => {
+                                    name.push(c);
+                                }
+                            }
+                        }
+                        _ => name.push(c)
+                    }
+                    let _ = self.next();
+                }
+                if maybe_integer(&name) {
+                    if let Ok(n) = name.parse::<isize>() {
+                        return Ok(Some(n.into()));
+                    }
+                }
+                Ok(Some(name.intern()))
+            }
+        }
     }
 }
 
-impl<R: std::io::Read> Stream<R> {
-    fn new(reader: BufReader<R>) -> Self {
-        Self {reader, buf: VecDeque::new(), line: 1}
+#[inline(always)]
+fn maybe_integer(s: &str) -> bool {
+    if s.is_empty() {
+        return false;
     }
-    fn read_with_block(&mut self, buf: &mut [u8]) -> Result<usize, std::io::Error> {
-        match self.reader.read(buf) {
-            Err(ref e) if e.kind() == ErrorKind::WouldBlock => {
-                self.reader.get_mut().read(buf)
-            }
-            x => x
-        }
+    let bytes = s.as_bytes();
+    if bytes[0].is_ascii_digit() && bytes[0] != b'0' {
+        return true;
     }
-    fn any_byte(&mut self) -> Result<u8, ParseErr> {
-        let c = self.peek()?;
-        if c == '\n' as u8 {
-            self.line += 1;
-        }
-        unsafe {
-            self.buf.pop_front().unwrap_unchecked();
-            Ok(c)
-        }
+    if bytes[0] == b'-' && bytes.len() >= 2 
+        && bytes[1].is_ascii_digit() && bytes[1] != b'0' {
+        return true;
     }
+    if s == "0" {
+        return true;
+    }
+    false
 }
 
 #[inline(always)]
@@ -1755,164 +2278,118 @@ fn cons(car: Val, cdr: Val) -> Val {
     car.cons(cdr)
 }
 
-fn swap_one(env: &mut Env, i: usize, addr: &mut Val) -> Result<bool, Exception> {
-    let mut default = env.nil();
-    if addr.is_sym() {
-        let addr = addr.copy().remove_tag(SYM);
-        if addr.var().val.is_captured() {
-            std::mem::swap(env.arg_stack.get_mut(i).unwrap_or(&mut default),
-                            &mut addr.var().val.captured());
-        } else {
-            std::mem::swap(env.arg_stack.get_mut(i).unwrap_or(&mut default),
-                            &mut addr.var().val);
-        }
-    } else {
-        std::mem::swap(env.arg_stack.get_mut(i).unwrap_or(&mut default),
-                        &mut env.set_val);
-        let _ = env.eval(Mode::Set, addr)?;
-        std::mem::swap(env.arg_stack.get_mut(i).unwrap_or(&mut default),
-                        &mut env.set_val);
-    }
-    if i >= env.arg_stack.len() {
-        env.push(default);
-    }
-    Ok(true)
-}
-
 fn swap(env: &mut Env, mode: Mode, ast: &Val) -> Result<bool, Exception> {
     let mut ast = ast;
-    let mut addrs = ast.next().ok_or_else(|| env.argument_err("swap", 0, "2"))?;
-    let cmd = ast.next().ok_or_else(|| env.argument_err("swap", 1, "2"))?;
+    let mut addr = ast.next().ok_or_else(|| env.argument_err("swap", 0, "2"))?;
 
-    let m = if addrs.is_cell() && addrs.cdr().is_cell() {
-        Mode::Multi
+    let old_stack_len = env.eval_args(ast)?;
+    env.arg_stack.truncate(old_stack_len + 1);
+
+    let val = env.arg_stack.pop().unwrap_or_else(||env.nil());
+    if addr.is_var() {
+        env.push(if addr.var().val.is_captured() {
+            std::mem::replace(addr.var().val.captured(), val)
+        } else {
+            std::mem::replace(&mut addr.var().val, val)
+        });
+        Ok(true)
+    } else if addr.is_cell() {
+        env.set_val = val;
+        let result = env.eval(Mode::Set, addr)?;
+        if env.set_val == env.sym.swap_done {
+            env.set_val = env.nil();
+            Ok(true)
+        } else {
+            env.set_val = env.nil();
+            Err(env.type_err("swap", addr, "swappable address"))
+        }
     } else {
-        Mode::Single
-    };
-    let old_stack_len = env.arg_stack.len();
-    let mut i = old_stack_len;
-    let result = env.eval(m, cmd);
-
-    while addrs.is_cell() {
-        swap_one(env, i, &mut addrs.car_mut());
-        i += 1;
-        addrs = addrs.cdr();
+        Err(env.type_err("swap", addr, "swappable address"))
     }
-
-    if m == Mode::Multi {
-        env.stack_to_list(mode, old_stack_len);
-    }
-    result
 }
 
-fn var_bind(env: &mut Env, binds: &Val) -> Result<(), Exception> {
-    if binds.is_cell() && binds.cdr().is_cell() {
-        let vars = binds.car();
-        let old_var_stack_len = env.ver_stack.len();
-        let old_stack_len = env.arg_stack.len();
-
-        let mode = if vars.is_cell() {
-            for var in vars {
-                if !vars.is_sym() {
-                    return Err(env.type_err("let", vars, "symbol"));
-                }
-                env.ver_stack.push(var.clone());
-                env.ver_stack.push(env.nil());
-            }
-            Mode::Multi
-        } else if vars.is_sym() {
-            env.ver_stack.push(vars.clone());
-            env.ver_stack.push(env.nil());
-            Mode::Single
-        } else {
-            return Err(env.type_err("let", vars, "symbol"));
-        };
-
-        let _ = env.eval(mode, binds.cdr().car());
-        let _ = var_bind(env, binds.cdr().cdr())?;
-
-        let _ = env.bind(old_var_stack_len, old_stack_len)?;
+fn func(env: &mut Env, mode: Mode, ast: &Val) -> Result<bool, Exception> {
+    let old_stack_len = env.eval_args(ast)?;
+    if env.arg_stack.len() != old_stack_len + 1 {
+        return Err(env.argument_err("func", 0, "1"));
     }
-    Ok(())
+
+    let name = env.arg_stack.pop().unwrap();
+    if name.is_sym() {
+        env.push(name.sym().func.clone());
+        if mode == Mode::Set {
+            let new = std::mem::replace(&mut env.set_val, env.sym.swap_done.clone());
+            name.sym().func = new;
+        }
+        Ok(true)
+    } else {
+        Err(env.type_err("func", &name, "symbol"))
+    }
 }
 fn var(env: &mut Env, mode: Mode, ast: &Val) -> Result<bool, Exception> {
-    let mut ast = ast;
-    let binds = ast.next().ok_or_else(|| env.argument_err("let", 0, "2"))?;
-    let body = ast.next().ok_or_else(|| env.argument_err("let", 1, "2"))?;
-
-    let old_var_stack_len = env.ver_stack.len();
-    let _ = var_bind(env, &binds)?;
-    let result = env.eval(mode, &body);
-    env.unbind(old_var_stack_len);
-    result
-}
-fn def_internal(env: &mut Env, ast: &Val, fenv: Val) -> Result<bool, Exception> {
-    let mut ast = ast;
-    let name = ast.next().ok_or_else(|| env.argument_err("fn", 0, "3 or more"))?;
-    let args = ast.next().ok_or_else(|| env.argument_err("fn", 1, "3 or more"))?;
-    if !ast.is_cell() {
-        return Err(env.argument_err("fn", 2, "3 or more"));
+    let old_stack_len = env.eval_args(ast)?;
+    if env.arg_stack.len() != old_stack_len + 1 {
+        return Err(env.argument_err("var", 0, "1"));
     }
-    let body = if ast.cdr().is_cell() {
-        cons(env.sym.progn.clone(), ast.clone())
-    } else {
-        ast.car().clone()
-    };
 
-    name.sym().func = cons(fenv, cons(args.clone(), cons(body, env.nil())));
-    Ok(true)
+    let name = env.arg_stack.pop().unwrap();
+    if name.is_sym() {
+        env.push(name.copy().remove_tag(SYM));
+        Ok(true)
+    } else {
+        Err(env.type_err("var", &name, "symbol"))
+    }
 }
-fn def(env: &mut Env, _: Mode, ast: &Val) -> Result<bool, Exception> {
-    def_internal(env, ast, env.nil())
-}
-fn mac(env: &mut Env, mode: Mode, ast: &Val) -> Result<bool, Exception> {
-    def_internal(env, ast, env.sym.mac.clone())
-}
+    
 fn if_(env: &mut Env, mode: Mode, ast: &Val) -> Result<bool, Exception> {
     let mut ast = ast;
     loop { unsafe {
         if !ast.is_cell() {
-            env.push(env.nil());
-            return Ok(true);
+            let result = env.nil();
+            let result = std::mem::replace(&mut env.ret, result);
+            env.push(result);
+            return Ok(false);
         }
         let car = ast.car();
         ast = ast.cdr();
         if !ast.is_cell() {
-            return env.eval(mode, car);
+            return env.eval(mode.for_special_form(), car);
         }
         let cond = env.eval(Mode::Single, car)?;
         env.ret = env.arg_stack.pop().unwrap();
         if cond {
-            return env.eval(mode, ast.car());
+            return env.eval(mode.for_special_form(), ast.car());
         }
         ast = ast.cdr();
     }}
 }
 fn progn(env: &mut Env, mode: Mode, ast: &Val) -> Result<bool, Exception> {
     let mut args = ast;
-    let mut result = Ok(true);
     if args.is_cell() {
-        let result = env.eval(Mode::Single, args.car());
-        args = args.cdr();
+        while args.cdr().is_cell() {
+            let _ = env.eval(mode.for_progn(), args.car());
+            env.ret = env.arg_stack.pop().unwrap();
+            args = args.cdr();
+        }
+        let result = env.eval(mode.for_special_form(), args.car());
+        env.ret = env.nil();
+        result
+    } else {
+        env.push(env.nil());
+        Ok(true)
     }
-    while args.is_cell() {
-        env.ret = env.arg_stack.pop().unwrap();
-        let result = env.eval(Mode::Single, args.car());
-        args = args.cdr();
-    }
-    result
 }
 fn env(env: &mut Env, _: Mode, ast: &Val) -> Result<bool, Exception> {
-    let mut vers = ast;
+    let mut vars = ast;
     let mut fenv = env.nil();
-    while vers.is_cell() {
+    while vars.is_cell() {
         unsafe {
-            let var = vers.car().copy().remove_tag(SYM);
+            let var = vars.car().copy().remove_tag(SYM);
             let val = (*var.var).val.clone();
             let captured = val.capture();
             (*var.var).val = captured.clone();
             fenv = cons(captured, cons(var, fenv));
-            vers = vers.cdr();
+            vars = vars.cdr();
         }
     }
     env.push(fenv);
@@ -1928,7 +2405,7 @@ fn while_(env: &mut Env, mode: Mode, ast: &Val) -> Result<bool, Exception> {
     let mut stack_len = old_stack_len;
     while env.eval(Mode::Single, cond)? {
         env.ret = env.arg_stack.pop().unwrap();
-        match  env.eval(Mode::Single, body) {
+        match  env.eval(mode.for_progn(), body) {
             Ok(x) => {
                 result = x;
                 let _ = env.arg_stack.pop().unwrap();
@@ -1974,6 +2451,33 @@ fn raise(env: &mut Env, mode: Mode, ast: &Val) -> Result<bool, Exception> {
         env.push(env.nil());
     }
     Err(Exception::Other)
+}
+fn return_(env: &mut Env, mode: Mode, ast: &Val) -> Result<bool, Exception> {
+    if ast.is_cell() {
+        if env.eval(mode.for_return(), ast.car())? {
+            Err(Exception::Return)
+        } else {
+            Err(Exception::ReturnFail)
+        }
+    } else {
+        env.push(env.nil());
+        Err(Exception::Return)
+    }
+}
+fn break_(env: &mut Env, mode: Mode, ast: &Val) -> Result<bool, Exception> {
+    if ast.is_cell() {
+        if env.eval(mode.for_return(), ast.car())? {
+            Err(Exception::Break)
+        } else {
+            Err(Exception::BreakFail)
+        }
+    } else {
+        env.push(env.nil());
+        Err(Exception::Break)
+    }
+}
+fn continue_(env: &mut Env, mode: Mode, ast: &Val) -> Result<bool, Exception> {
+    Err(Exception::Continue)
 }
 fn catch(env: &mut Env, mode: Mode, ast: &Val) -> Result<bool, Exception> {
     let old_arg_stack_len = env.arg_stack.len();
@@ -2040,7 +2544,14 @@ fn arg(env: &mut Env, mode: Mode, ast: &Val) -> Result<bool, Exception> {
             return Ok(false);
         }
 
-        env.push(env.rest_stack[env.rest_stack.len() - (n as usize)].clone());
+        let l = env.rest_stack.len();
+        if mode == Mode::Set {
+            let new = std::mem::replace(&mut env.set_val, env.sym.swap_done.clone());
+            let old = std::mem::replace(&mut env.rest_stack[l - (n as usize)], new);
+            env.push(old);
+        } else {
+            env.push(env.rest_stack[l - (n as usize)].clone());
+        }
     }
     Ok(true)
 }
@@ -2059,7 +2570,7 @@ fn spawn(env: &mut Env, mode: Mode, ast: &Val) -> Result<bool, Exception> {
                 exit(0);
             }
             let old_stack_len = env.arg_stack.len();
-            match env.eval(mode, ast.car()) {
+            match env.eval(mode.for_special_form(), ast.car()) {
                 Ok(true) => exit(0),
                 Ok(false) => {
                     env.arg_stack.truncate(old_stack_len + 1);
@@ -2082,10 +2593,36 @@ fn spawn(env: &mut Env, mode: Mode, ast: &Val) -> Result<bool, Exception> {
     }
     Ok(true)
 }
+fn wait(env: &mut Env, mode: Mode, ast: &Val) -> Result<bool, Exception> {
+    let old_stack_len = env.eval_args(ast)?;
+    if env.arg_stack.len() - old_stack_len != 1 {
+        return Err(env.argument_err("-", env.arg_stack.len() - old_stack_len, "1"));
+    }
+
+    let pid: isize = env.arg_stack.pop().unwrap().try_into()
+        .or_else(|v|Err(env.type_err_conv("wait", &v)))?;
+    let mut status: libc::c_int = 0;
+    unsafe {
+        let ret = waitpid(pid as pid_t, &mut status as *mut _, 0);
+        if ret == -1 {
+            return Err(env.other_err(env.sym.syscall_err.clone(),
+            format!("wait: failed to wait {}", pid)));
+        }
+        if WIFEXITED(status) {
+            let code = WEXITSTATUS(status);
+            env.push(code.into());
+            Ok(code == 0)
+        } else {
+            Err(env.other_err(env.sym.syscall_err.clone(),
+            "wait: failed to get error code".to_string()))
+        }
+    }
+}
+
 fn collect(env: &mut Env, mode: Mode, ast: &Val) -> Result<bool, Exception> {
     let old_stack_len = env.arg_stack.len();
     let result = env.eval(mode, ast.car());
-    env.push(Val{id: old_stack_len << 1 + 1});
+    env.push(Val{id: (old_stack_len << 1) + 1});
     Err(Exception::Collect)
 }
 fn quote(env: &mut Env, mode: Mode, ast: &Val) -> Result<bool, Exception> {
@@ -2120,6 +2657,10 @@ fn back_quote(env: &mut Env, mode: Mode, ast: &Val) -> Result<bool, Exception> {
 fn gensym(env: &mut Env, mode: Mode, ast: &Val) -> Result<bool, Exception> {
     env.push(format!("gensym-{}", env.gensym_id).to_sym(env.nil().clone(), env.nil().clone()));
     env.gensym_id += 1;
+    Ok(true)
+}
+
+fn trap(env: &mut Env, mode: Mode, ast: &Val) -> Result<bool, Exception> {
     Ok(true)
 }
 
@@ -2330,12 +2871,14 @@ where
 {
     let old_stack_len = env.arg_stack.len();
     let mut ast = ast;
+    let mut cond = true;
     while ast.is_cell() {
-        if !env.eval(Mode::None, ast.car())? {
-            env.arg_stack.truncate(old_stack_len);
-            return Ok(false);
-        }
+        cond &= env.eval(Mode::None, ast.car())?;
         ast = ast.cdr();
+    }
+    if !cond {
+        env.leave_last_arg_or_nil(old_stack_len);
+        return Ok(false);
     }
 
     if old_stack_len == env.arg_stack.len() {
@@ -2350,6 +2893,7 @@ where
                     Err(m) => {
                         match fold_fn2::<f64, Op>(env, old_stack_len, m as f64) {
                             Ok(x) => {
+                                env.push(n.into());
                                 return Ok(x);
                             }
                             Err(_) => {
@@ -2359,6 +2903,7 @@ where
                         }
                     }
                     Ok(x) => {
+                        env.push(n.into());
                         return Ok(x);
                     }
                 }
@@ -2371,6 +2916,7 @@ where
                     Ok(f) => {
                         match fold_fn2::<f64, Op>(env, old_stack_len, f) {
                             Ok(x) => {
+                                env.push(f.into());
                                 return Ok(x);
                             }
                             Err(_) => {
@@ -2391,75 +2937,113 @@ where
 fn same(env: &mut Env, mode: Mode, ast: &Val) -> Result<bool, Exception> {
     let old_stack_len = env.arg_stack.len();
     let mut ast = ast;
+    let mut cond = true;
     while ast.is_cell() {
-        if !env.eval(Mode::None, ast.car())? {
-            env.arg_stack.truncate(old_stack_len);
-            return Ok(false);
-        }
+        cond &= env.eval(Mode::None, ast.car())?;
         ast = ast.cdr();
+    }
+    if !cond {
+        env.leave_last_arg_or_nil(old_stack_len);
+        return Ok(false);
     }
 
     if old_stack_len + 2 > env.arg_stack.len() {
-        env.leave_first_arg_or_nil(old_stack_len);
+        env.leave_last_arg_or_nil(old_stack_len);
         return Ok(true);
     }
 
     let v = env.arg_stack.pop().unwrap();
     let s = v.to_path()
-        .or_else(|_|Err(env.type_err("=", &v, "symbol or string or number")))?;
-    let mut u = v.clone();
-    for _ in old_stack_len..env.arg_stack.len() - 1 {
-        u = env.arg_stack.pop().unwrap();
-        match v.to_path() {
+        .or_else(|_|Err(env.type_err_to_str("=", &v)))?;
+    let mut result = true;
+    for _ in old_stack_len..env.arg_stack.len() {
+        let u = env.arg_stack.pop().unwrap();
+        match u.to_path() {
             Err(_)  => {
-                return Err(env.type_err("=", &u, "symbol or string or number"));
+                return Err(env.type_err_to_str("=", &u));
             }
             Ok(t) => {
                 if s != t {
-                    if old_stack_len < env.arg_stack.len() {
-                        env.arg_stack.truncate(old_stack_len + 1);
-                    } else {
-                        env.push(u);
-                    }
-                    return Ok(false);
+                    result = false;
+                    break;
                 }
             }
         }
     }
-    env.push(u);
-    Ok(true)
+    env.push(v);
+    Ok(result)
 }
 fn is(env: &mut Env, mode: Mode, ast: &Val) -> Result<bool, Exception> {
     let old_stack_len = env.arg_stack.len();
     let mut ast = ast;
+    let mut cond = true;
     while ast.is_cell() {
-        if !env.eval(Mode::None, ast.car())? {
-            env.arg_stack.truncate(old_stack_len);
-            return Ok(false);
-        }
+        cond &= env.eval(Mode::None, ast.car())?;
         ast = ast.cdr();
+    }
+    if !cond {
+        env.leave_last_arg_or_nil(old_stack_len);
+        return Ok(false);
     }
 
     if old_stack_len + 2 > env.arg_stack.len() {
-        env.leave_first_arg_or_nil(old_stack_len);
+        env.leave_last_arg_or_nil(old_stack_len);
         return Ok(true);
     }
 
     let v = env.arg_stack.pop().unwrap();
-    let mut u = v.clone();
-    for _ in old_stack_len..env.arg_stack.len() - 1 {
-        u = env.arg_stack.pop().unwrap();
+    let mut result = true;
+    for _ in old_stack_len..env.arg_stack.len() {
+        let u = env.arg_stack.pop().unwrap();
         if v != u {
-            if old_stack_len < env.arg_stack.len() {
-                env.arg_stack.truncate(old_stack_len + 1);
-            } else {
-                env.push(u);
-            }
-            return Ok(false);
+            result = false;
+            break;
         }
     }
-    env.push(u);
-    Ok(true)
+    env.arg_stack.truncate(old_stack_len);
+    env.push(v);
+    Ok(result)
+}
+fn in_(env: &mut Env, mode: Mode, ast: &Val) -> Result<bool, Exception> {
+    let old_stack_len = env.arg_stack.len();
+    let mut ast = ast;
+    let mut cond = true;
+    while ast.is_cell() {
+        cond &= env.eval(Mode::None, ast.car())?;
+        ast = ast.cdr();
+    }
+    if !cond {
+        env.leave_last_arg_or_nil(old_stack_len);
+        return Ok(false);
+    }
+
+    if old_stack_len + 2 > env.arg_stack.len() {
+        env.leave_last_arg_or_nil(old_stack_len);
+        return Ok(true);
+    }
+
+    let v = env.arg_stack.pop().unwrap();
+    let mut result = true;
+    for _ in old_stack_len..env.arg_stack.len() - 1 {
+        let u = env.arg_stack.pop().unwrap();
+        if u.is_cell() {
+            for u in &u {
+                if &v != u {
+                    result = false;
+                    break;
+                }
+            }
+        } else {
+            if v != u {
+                result = false;
+                break;
+            }
+        }
+    }
+
+    env.arg_stack.truncate(old_stack_len);
+    env.push(v);
+    Ok(result)
 }
 fn mod_(env: &mut Env, mode: Mode, ast: &Val) -> Result<bool, Exception> {
     let old_stack_len = env.eval_args(ast)?;
@@ -2522,12 +3106,12 @@ fn re(env: &mut Env, mode: Mode, ast: &Val) -> Result<bool, Exception> {
     let u = env.arg_stack.pop().unwrap();
 
     let s = v.to_str()
-        .or_else(|_|Err(env.type_err("~", &v, "symbol or string or number")))?;
+        .or_else(|_|Err(env.type_err_to_str("~", &v)))?;
     let re = Regex::new(&s)
         .or_else(|_|Err(env.regex_err("~", &s)))?;
 
     let t = u.to_str()
-        .or_else(|_|Err(env.type_err("~", &u, "symbol or string or number")))?;
+        .or_else(|_|Err(env.type_err_to_str("~", &u)))?;
     let result = re.is_match(&t);
 
     env.push(u);
@@ -2592,17 +3176,24 @@ fn is_float(env: &mut Env, mode: Mode, ast: &Val) -> Result<bool, Exception> {
     }
     Ok(env.arg_stack[old_stack_len].is_float())
 }
-fn is_stream(env: &mut Env, mode: Mode, ast: &Val) -> Result<bool, Exception> {
+fn is_buffered(env: &mut Env, mode: Mode, ast: &Val) -> Result<bool, Exception> {
     let old_stack_len = env.eval_args(ast)?;
     if old_stack_len + 1 != env.arg_stack.len() {
-        return Err(env.argument_err("is_float", env.arg_stack.len() - old_stack_len, "1"));
+        return Err(env.argument_err("is_buf", env.arg_stack.len() - old_stack_len, "1"));
     }
-    Ok(env.arg_stack[old_stack_len].is_stream())
+    Ok(env.arg_stack[old_stack_len].is_buf())
+}
+fn is_chars(env: &mut Env, mode: Mode, ast: &Val) -> Result<bool, Exception> {
+    let old_stack_len = env.eval_args(ast)?;
+    if old_stack_len + 1 != env.arg_stack.len() {
+        return Err(env.argument_err("is_chars", env.arg_stack.len() - old_stack_len, "1"));
+    }
+    Ok(env.arg_stack[old_stack_len].is_chars())
 }
 fn is_file(env: &mut Env, mode: Mode, ast: &Val) -> Result<bool, Exception> {
     let old_stack_len = env.eval_args(ast)?;
     if old_stack_len + 1 != env.arg_stack.len() {
-        return Err(env.argument_err("is_float", env.arg_stack.len() - old_stack_len, "1"));
+        return Err(env.argument_err("is_file", env.arg_stack.len() - old_stack_len, "1"));
     }
     Ok(env.arg_stack[old_stack_len].is_file())
 }
@@ -2614,14 +3205,15 @@ fn cons_(env: &mut Env, mode: Mode, ast: &Val) -> Result<bool, Exception> {
     }
 
     let mut cdr = env.arg_stack.pop().unwrap();
-    while env.arg_stack.len() > old_stack_len + 1 {
-        cdr = cons(env.arg_stack.pop().unwrap(), cdr);
-    }
     if mode == Mode::Multi {
-        env.push(cdr);
+        for v in &cdr {
+            env.push(v.clone());
+        }
         env.push(env.sym.multi_done.clone());
     } else {
-        cdr = cons(env.arg_stack.pop().unwrap(), cdr);
+        while env.arg_stack.len() > old_stack_len {
+            cdr = cons(env.arg_stack.pop().unwrap(), cdr);
+        }
         env.push(cdr);
     }
     Ok(true)
@@ -2633,7 +3225,13 @@ fn head(env: &mut Env, mode: Mode, ast: &Val) -> Result<bool, Exception> {
     }
     let v = env.arg_stack.pop().unwrap();
     if v.is_cell() {
-        env.push(v.car().clone());
+        if mode == Mode::Set {
+            let new = std::mem::replace(&mut env.set_val, env.sym.swap_done.clone());
+            let old = std::mem::replace(v.car_mut(), new);
+            env.push(old);
+        } else {
+            env.push(v.car().clone());
+        }
     } else if v.is_nil()  {
         env.push(env.nil());
     } else {
@@ -2648,7 +3246,13 @@ fn rest(env: &mut Env, mode: Mode, ast: &Val) -> Result<bool, Exception> {
     }
     let v = env.arg_stack.pop().unwrap();
     if v.is_cell() {
-        env.push(v.cdr().clone());
+        if mode == Mode::Set {
+            let new = std::mem::replace(&mut env.set_val, env.sym.swap_done.clone());
+            let old = std::mem::replace(v.cdr_mut(), new);
+            env.push(old);
+        } else {
+            env.push(v.cdr().clone());
+        }
     } else if v.is_nil()  {
         env.push(env.nil());
     } else {
@@ -2671,7 +3275,7 @@ fn dict(env: &mut Env, mode: Mode, ast: &Val) -> Result<bool, Exception> {
     let mut result = Val::new_dict();
     for _ in (0..arg_len).step_by(2) {
         let key = Cow::<Path>::try_from(env.rest_stack.pop().unwrap())
-            .or_else(|v|Err(env.type_err("dict", &v, "symbol or string or number")))?;
+            .or_else(|v|Err(env.type_err_to_str("dict", &v)))?;
         let val = env.rest_stack.pop().unwrap();
 
         result.dict().insert(key.into_owned(), val);
@@ -2692,7 +3296,7 @@ fn del(env: &mut Env, mode: Mode, ast: &Val) -> Result<bool, Exception> {
 
     for _ in 1..arg_len {
         let key = Cow::<Path>::try_from(env.rest_stack.pop().unwrap())
-            .or_else(|v|Err(env.type_err("del", &v, "symbol or string or number")))?;
+            .or_else(|v|Err(env.type_err_to_str("del", &v)))?;
         dict.dict().remove(&*key);
     }
 
@@ -2714,9 +3318,9 @@ fn split(env: &mut Env, mode: Mode, ast: &Val) -> Result<bool, Exception> {
         Err(v) => return Err(env.type_err("split", &v, "integer"))
     };
     let sep = Cow::<str>::try_from(env.arg_stack.pop().unwrap())
-        .or_else(|v|Err(env.type_err("split", &v, "symbol or string or number")))?;
+        .or_else(|v|Err(env.type_err_to_str("split", &v)))?;
     let s = Cow::<str>::try_from(env.arg_stack.pop().unwrap())
-        .or_else(|v|Err(env.type_err("split", &v, "symbol or string or number")))?;
+        .or_else(|v|Err(env.type_err_to_str("split", &v)))?;
 
     let re = Regex::new(&sep)
         .or_else(|_|Err(env.regex_err("split", &sep)))?;
@@ -2732,7 +3336,7 @@ fn flat_list(env: &mut Env, result: &mut Vec<PathBuf>, xs: &Val, globing: bool) 
     if xs.is_cell() {
         if xs.car() == &env.sym.glob {
             let s = xs.cdr().to_path()
-                .or_else(|_|Err(env.type_err("++", xs.cdr(), "symbol or string or number")))?;
+                .or_else(|_|Err(env.type_err_to_str("expand", xs.cdr())))?;
             result.push(s.to_path_buf());
         } else {
             for i in xs {
@@ -2741,11 +3345,11 @@ fn flat_list(env: &mut Env, result: &mut Vec<PathBuf>, xs: &Val, globing: bool) 
         }
     } else if globing {
         let s = xs.to_str()
-            .or_else(|_|Err(env.type_err("++", xs, "symbol or string or number")))?;
+            .or_else(|_|Err(env.type_err_to_str("expand", xs)))?;
         result.push(Pattern::escape(&*s).into())
     } else {
         let s = xs.to_path()
-            .or_else(|_|Err(env.type_err("++", xs, "symbol or string or number")))?;
+            .or_else(|_|Err(env.type_err_to_str("expand", xs)))?;
         result.push(s.to_path_buf());
     }
     Ok(())
@@ -2799,17 +3403,22 @@ fn brace_expand(env: &mut Env, mode: Mode, globing: bool, l: usize) -> Result<bo
     Ok(true)
 }
 fn expand(env: &mut Env, mode: Mode, ast: &Val) -> Result<bool, Exception> {
-    let old_stack_len = env.eval_args(ast)?;
-    let arg_n = env.arg_stack.len() - old_stack_len;
-    let mut cell_exist = false;
+    let old_stack_len = env.arg_stack.len();
     let mut globing = false;
+    for arg in ast {
+        if arg.is_cell() && arg.car() == &env.sym.glob {
+            globing == true;
+            env.push(arg.clone());
+        } else {
+            let _ = env.eval(Mode::None, arg)?;
+        }
+    }
+    let mut cell_exist = false;
+    let arg_n = env.arg_stack.len() - old_stack_len;
     for _ in 0..arg_n {
         let v = env.arg_stack.pop().unwrap();
         if !cell_exist && v.is_cell() {
             cell_exist = true;
-            if !globing && v.car() == &env.sym.glob {
-                globing == true;
-            }
         }
         env.rest_stack.push(v);
     }
@@ -2821,13 +3430,32 @@ fn expand(env: &mut Env, mode: Mode, ast: &Val) -> Result<bool, Exception> {
     let mut s = PathBuf::new();
     for _ in 0..arg_n {
         let path = Cow::<Path>::try_from(env.rest_stack.pop().unwrap())
-            .or_else(|v|Err(env.type_err("concat", &v, "symbol or string or number or list")))?;
+            .or_else(|v|Err(env.type_err_to_str("expand", &v)))?;
         s.push(path);
     }
 
     env.push(s.to_str());
     Ok(true)
 }
+fn glob_(env: &mut Env, mode: Mode, ast: &Val) -> Result<bool, Exception> {
+    let pattern = ast.to_str().unwrap();
+    let paths = glob(&*pattern).or_else(|_|Err(env.other_err(env.sym.glob_err.clone(),
+                        format!("{}: failed to path name expansion", pattern))))?;
+    let old_stack_len = env.arg_stack.len();
+    for j in paths {
+        let path = j.or_else(|e|Err(env.other_err(env.sym.glob_err.clone(),
+                format!("failed to path name expansion: detail={}", e))))?;
+        env.push(path.to_str());
+    }
+
+    if mode == Mode::None {
+        Ok(true)
+    } else {
+        env.stack_to_list(mode, old_stack_len);
+        Ok(true)
+    }
+}
+    
 fn str(env: &mut Env, mode: Mode, ast: &Val) -> Result<bool, Exception> {
     let old_stack_len = env.eval_args(ast)?;
     let arg_n = env.arg_stack.len() - old_stack_len;
@@ -2873,32 +3501,90 @@ fn readb(env: &mut Env, mode: Mode, ast: &Val) -> Result<bool, Exception> {
         }
     }
 }
-fn peekb(env: &mut Env, mode: Mode, ast: &Val) -> Result<bool, Exception> {
-    if !env.sym.stdin.var().val.is_stream() {
+fn read_char(env: &mut Env, mode: Mode, ast: &Val) -> Result<bool, Exception> {
+    if !env.sym.stdin.var().val.is_chars() {
         let v = env.sym.stdin.var().val.clone();
-        return Err(env.type_err("peekb", &v, "stream"));
+        return Err(env.type_err("readc", &v, "chars"));
     }
-    match env.sym.stdin.var().val.stream().peek() {
-        Ok(b) => {
-            env.push((b as isize).into());
+    match env.sym.stdin.var().val.chars().next() {
+        Ok(Some(c)) => {
+            env.push((c as isize).into());
             Ok(true)
         }
-        Err(ParseErr::TokenEnd)|Err(ParseErr::Eof) => {
+        Ok(_) => {
             env.push(env.nil());
             Ok(false)
         }
         Err(ParseErr::Read(e)) => {
-            Err(env.read_err("peekb", e))
+            Err(env.read_err("readc", e))
         }
         Err(_) => {
             panic!()
         }
     }
 }
-fn read_atom(env: &mut Env, mode: Mode, ast: &Val) -> Result<bool, Exception> {
+fn cur_line(env: &mut Env, mode: Mode, ast: &Val) -> Result<bool, Exception> {
+    if !env.sym.stdin.var().val.is_chars() {
+        let v = env.sym.stdin.var().val.clone();
+        return Err(env.type_err("cur-line", &v, "chars"));
+    }
+    env.push((env.sym.stdin.var().val.chars().line() as isize).into());
     Ok(true)
 }
+fn peek(env: &mut Env, mode: Mode, ast: &Val) -> Result<bool, Exception> {
+    if !env.sym.stdin.var().val.is_chars() {
+        let v = env.sym.stdin.var().val.clone();
+        return Err(env.type_err("peekc", &v, "chars"));
+    }
+    match env.sym.stdin.var().val.chars().peek() {
+        Ok(Some(c)) => {
+            env.push((c as isize).into());
+            Ok(true)
+        }
+        Ok(_) => {
+            env.push(env.nil());
+            Ok(false)
+        }
+        Err(ParseErr::Read(e)) => {
+            Err(env.read_err("peekc", e))
+        }
+        Err(_) => {
+            panic!()
+        }
+    }
+}
+fn parse(env: &mut Env, mode: Mode, ast: &Val) -> Result<bool, Exception> {
+    if !env.sym.stdin.var().val.is_chars() {
+        let v = env.sym.stdin.var().val.clone();
+        return Err(env.type_err("parse", &v, "chars"));
+    }
+    match env.sym.stdin.var().val.chars().parse(env) {
+        Ok(Some(val)) => {
+            env.push(val);
+            Ok(true)
+        }
+        Ok(_) => {
+            env.push(env.nil());
+            Ok(false)
+        }
+        Err(ParseErr::Read(e)) => {
+            Err(env.read_err("peekc", e))
+        }
+        Err(e) => {
+            Err(env.other_err(env.sym.parse_err.clone(),
+            format!("parse: {}", e)))
+        }
+    }
+}
 fn echo(env: &mut Env, mode: Mode, ast: &Val) -> Result<bool, Exception> {
+    let _ = print_internal(env, mode, ast, "echo");
+    env.sym.stdin.var().val.write(b"\n");
+    Ok(true)
+}
+fn print(env: &mut Env, mode: Mode, ast: &Val) -> Result<bool, Exception> {
+    print_internal(env, mode, ast, "print")
+}
+fn print_internal(env: &mut Env, mode: Mode, ast: &Val, name: &str) -> Result<bool, Exception> {
     let old_stack_len = env.eval_args(ast)?;
     let arg_n = env.arg_stack.len() - old_stack_len;
     if arg_n == 0 {
@@ -2906,33 +3592,54 @@ fn echo(env: &mut Env, mode: Mode, ast: &Val) -> Result<bool, Exception> {
     }
     let tmp = env.sym.ifs.var().val.clone();
     let ifs = tmp.to_path()
-        .or_else(|v|Err(env.type_err("echo", &tmp, "symbol or string or number")))?;
+        .or_else(|v|Err(env.type_err_to_str(name, &tmp)))?;
+    let ifs = ifs.as_os_str().as_encoded_bytes();
 
     for _ in 0..arg_n {
         env.rest_stack.push(env.arg_stack.pop().unwrap());
     }
     let path = Cow::<Path>::try_from(env.rest_stack.pop().unwrap())
-        .or_else(|v|Err(env.type_err("echo", &v, "symbol or string or number")))?;
-    env.sym.stdin.var().val.write(path.as_os_str().as_encoded_bytes());
+        .or_else(|v|Err(env.type_err_to_str(name, &v)))?;
+    env.sym.stdout.var().val.write(path.as_os_str().as_encoded_bytes());
     for _ in 1..arg_n {
         let path = Cow::<Path>::try_from(env.rest_stack.pop().unwrap())
-            .or_else(|v|Err(env.type_err("echo", &v, "symbol or string or number")))?;
-        env.sym.stdin.var().val.write(ifs.as_os_str().as_encoded_bytes());
-        env.sym.stdin.var().val.write(path.as_os_str().as_encoded_bytes());
+            .or_else(|v|Err(env.type_err_to_str(name, &v)))?;
+        env.sym.stdout.var().val.write(ifs);
+        env.sym.stdout.var().val.write(path.as_os_str().as_encoded_bytes());
     }
-    env.sym.stdin.var().val.write(b"\n");
     env.push(env.nil());
 
     Ok(true)
 }
-fn printf(env: &mut Env, mode: Mode, ast: &Val) -> Result<bool, Exception> {
+fn show(env: &mut Env, mode: Mode, ast: &Val) -> Result<bool, Exception> {
+    let old_stack_len = env.eval_args(ast)?;
+    let arg_n = env.arg_stack.len() - old_stack_len;
+    if arg_n == 0 {
+        return Ok(true);
+    }
+    let tmp = env.sym.ifs.var().val.clone();
+    let ifs = tmp.to_path()
+        .or_else(|v|Err(env.type_err_to_str("show", &tmp)))?;
+    let ifs = ifs.as_os_str().as_encoded_bytes();
+
+    for _ in 0..arg_n {
+        env.rest_stack.push(env.arg_stack.pop().unwrap());
+    }
+    write!(env.sym.stdout.var().val, "{}", env.rest_stack.pop().unwrap());
+    for _ in 1..arg_n {
+        env.sym.stdout.var().val.write(ifs);
+        write!(env.sym.stdout.var().val, "{}", env.rest_stack.pop().unwrap());
+    }
+    env.push(env.nil());
+
     Ok(true)
 }
+    
 fn pipe(env: &mut Env, mode: Mode, ast: &Val) -> Result<bool, Exception> {
     match std::io::pipe() {
         Ok((r, w)) => {
-            env.push(Val::new_piper(r));
-            env.push(Val::new_pipew(w));
+            env.push(r.into());
+            env.push(w.into());
             env.stack_to_list(mode,  env.arg_stack.len() - 2);
             Ok(true)
         }
@@ -2950,13 +3657,32 @@ fn buf(env: &mut Env, _: Mode, ast: &Val) -> Result<bool, Exception> {
     let mut val = env.arg_stack.pop().unwrap();
     env.arg_stack.push(
         if val.is_file() {
-            Val::new_stream(Box::new(Stream::new(BufReader::new(val.move_file()))))
+            Val::new_buf(Box::new(BufReader::new(val.move_file())))
         } else if val.is_piper() {
-            Val::new_stream(Box::new(Stream::new(BufReader::new(val.move_piper()))))
-        } else if val == env.sym.stdin {
-            Val::new_stream(Box::new(Stream::new(BufReader::new(io::stdin()))))
+            Val::new_buf(Box::new(BufReader::new(val.move_piper())))
+        } else if let Ok(s) = val.to_str() {
+            Val::new_buf(Box::new(BufReader::new(Cursor::new(s.to_string()))))
         } else {
-            return Err(env.type_err("buf", &val, "fd"));
+            return Err(env.type_err("buf", &val, "fd or displayable value"));
+        }
+    );
+    Ok(true)
+}
+fn chars(env: &mut Env, _: Mode, ast: &Val) -> Result<bool, Exception> {
+    let old_stack_len = env.eval_args(ast)?;
+    if env.arg_stack.len() - old_stack_len != 1 {
+        return Err(env.argument_err("chars", env.arg_stack.len() - old_stack_len, "1"));
+    }
+    let mut val = env.arg_stack.pop().unwrap();
+    env.arg_stack.push(
+        if val.is_file() {
+            Val::new_chars(Box::new(PeekableReader::new(BufReader::new(val.move_file()))))
+        } else if val.is_piper() {
+            Val::new_chars(Box::new(PeekableReader::new(BufReader::new(val.move_piper()))))
+        } else if let Ok(s) = val.to_str() {
+            Val::new_chars(Box::new(PeekableReader::new(BufReader::new(Cursor::new(s.to_string())))))
+        } else {
+            return Err(env.type_err("chars", &val, "fd or displayable value"));
         }
     );
     Ok(true)
@@ -2967,14 +3693,22 @@ fn open(env: &mut Env, _: Mode, ast: &Val) -> Result<bool, Exception> {
         return Err(env.argument_err("open", env.arg_stack.len() - old_stack_len, "0 or 1"));
     }
     if old_stack_len == env.arg_stack.len() {
-        //todo
+        match tempfile() {
+            Ok(f) => {
+                env.arg_stack.push(f.into());
+            }
+            Err(e) => {
+                return Err(env.other_err(env.sym.syscall_err.clone(),
+                format!("open: failed to open tempfile: detail={}", e)));
+            }
+        }
     } else {
         let val = env.arg_stack.pop().unwrap();
         let path = val.to_path()
-            .or_else(|_|Err(env.type_err("open", &val, "symbol or string or number")))?;
+            .or_else(|_|Err(env.type_err_to_str("open", &val)))?;
         match OpenOptions::new().read(true).write(true).create(true).open(&path) {
             Ok(f) => {
-                env.arg_stack.push(Val::new_file(f));
+                env.arg_stack.push(f.into());
             }
             Err(e) => {
                 return Err(env.other_err(env.sym.syscall_err.clone(),
@@ -2984,24 +3718,102 @@ fn open(env: &mut Env, _: Mode, ast: &Val) -> Result<bool, Exception> {
     }
     Ok(true)
 }
-fn load(env: &mut Env, mode: Mode, ast: &Val) -> Result<bool, Exception> {
+fn macro_expand(env: &mut Env, mode: Mode, ast: &Val) -> Result<bool, Exception> {
+    let old_stack_len = env.eval_args(ast)?;
+    if env.arg_stack.len() - old_stack_len != 1 {
+        return Err(env.argument_err("macro_expand", env.arg_stack.len() - old_stack_len, "1"));
+    }
+    let v = env.arg_stack.pop().unwrap();
+    let result = env.macro_expand(&v).unwrap_or_else(||v);
+    let mut def_vars = HashMap::new();
+    let mut ref_vars = HashSet::new();
+    let result = env.scope_analyze(&result, &mut def_vars, &mut ref_vars)?.unwrap_or_else(||result);
+    env.push(result);
+
     Ok(true)
 }
-fn setenv(env: &mut Env, mode: Mode, ast: &Val) -> Result<bool, Exception> {
-    Ok(true)
+fn eval(env: &mut Env, mode: Mode, ast: &Val) -> Result<bool, Exception> {
+    let old_stack_len = env.eval_args(ast)?;
+    if env.arg_stack.len() - old_stack_len != 1 {
+        return Err(env.argument_err("eval", env.arg_stack.len() - old_stack_len, "1"));
+    }
+    let v = env.arg_stack.pop().unwrap();
+    env.eval(mode, &v)
 }
+fn fail(env: &mut Env, mode: Mode, ast: &Val) -> Result<bool, Exception> {
+    if ast.is_cell() {
+        let _ = env.eval(mode, ast.car())?;
+    } else {
+        env.push(env.nil());
+    }
+    Ok(false)
+}
+
 fn getenv(env: &mut Env, mode: Mode, ast: &Val) -> Result<bool, Exception> {
-    Ok(true)
+    let old_stack_len = env.eval_args(ast)?;
+    if env.arg_stack.len() - old_stack_len != 1 {
+        return Err(env.argument_err("env-var", env.arg_stack.len() - old_stack_len, "1"));
+    }
+    let var = env.arg_stack.pop().unwrap();
+    let s = var.to_path()
+            .or_else(|_|Err(env.type_err_to_str("env-var", &var)))?;
+    let result = match env::var(s.as_os_str()) {
+        Ok(value) => {
+            env.push(value.to_str());
+            Ok(true)
+        }
+        Err(e) => {
+            env.push(env.nil());
+            Ok(false)
+        }
+    };
+    if mode == Mode::Set {
+        let new = std::mem::replace(&mut env.set_val, env.sym.swap_done.clone());
+        let t = new.to_path()
+            .or_else(|_|Err(env.type_err_to_str("env-var", &env.set_val.clone())))?;
+        env::set_var(s.as_os_str(), t.as_os_str());
+    }
+    result
 }
-
-            
-
-                    
-                
-                    
-
 
 fn main() {
-
-
+    let mut env = Env::new(1024, 1024);
+    let mut args = env::args().skip(1);
+    while let Some(arg) = args.next() {
+        if arg == "-c" {
+            if let Some(code) = args.next() {
+                match PeekableReader::new(Cursor::new(code)).parse(&mut env) {
+                    Ok(Some(ast)) => {
+                        println!("{}", ast);
+                        match env.eval(Mode::None, &ast) {
+                            Ok(x) => {
+                                println!("{}", x);
+                                println!("{}", env.arg_stack.pop().unwrap());
+                            }
+                            Err(Exception::Other) => {
+                                println!("{}", env.arg_stack.pop().unwrap());
+                                println!("{}", env.arg_stack.pop().unwrap());
+                            }
+                            Err(e) => println!("{:?}", e)
+                        }
+                    }
+                    Ok(None) => println!("EoF"),
+                    Err(e) => println!("{}", e)
+                }
+            }
+        } else {
+            match OpenOptions::new().read(true).write(true).create(true).open(&arg) {
+                Ok(fd) => {
+                    match PeekableReader::new(fd).parse(&mut env) {
+                        Ok(Some(ast)) => println!("{}", ast),
+                        Ok(None) => println!("EoF"),
+                        Err(e) => println!("{}", e)
+                    }
+                }
+                Err(e) => {
+                    println!("shino: failed to open {}: detail={}", arg, e);
+                }
+            }
+        }
+    }
 }
