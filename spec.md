@@ -715,10 +715,12 @@ cdr部にdelayオブジェクトの入ったセルを返す。
 
 **Usage**: `== value...`  
 **Takes**: `any...`  
-**Returns**: `boolean`
+**Returns**: `any`
 
 **Description**:
-数値と解釈した場合の同値性を判定する。
+数値と解釈した場合の同値性を判定し成り立つ場合に成功する。
+一番右の値を返す。
+ただし、引数の評価が失敗で返る場合は失敗する。
 
 **Examples**:
 ```lisp
@@ -731,10 +733,11 @@ cdr部にdelayオブジェクトの入ったセルを返す。
 
 **Usage**: `= value...`  
 **Takes**: `any...`  
-**Returns**: `boolean`
+**Returns**: `any`
 
 **Description**:
-文字列と解釈した場合の同値性を判定する。
+文字列と解釈した場合の同値性を判定し成り立つ場合に成功する。
+一番右の値を返す。ただし、引数の評価が失敗で返る場合は失敗する。
 
 **Examples**:
 ```lisp
@@ -747,10 +750,11 @@ cdr部にdelayオブジェクトの入ったセルを返す。
 
 **Usage**: `is value value`  
 **Takes**: `any any`  
-**Returns**: `boolean`
+**Returns**: `any`
 
 **Description**:
-オブジェクトの同一性を判定する。
+オブジェクトの同一性を判定し成り立つ場合に成功する。
+一番右の値を返す。ただし、引数の評価が失敗で返る場合は失敗する。
 
 **Examples**:
 ```lisp
@@ -763,10 +767,11 @@ cdr部にdelayオブジェクトの入ったセルを返す。
 
 **Usage**: `< numeric...`  
 **Takes**: `numeric...`  
-**Returns**: `boolean`
+**Returns**: `any`
 
 **Description**:
-数値の大小比較（小なり）を行う。
+数値の大小比較（小なり）を行い成り立つ場合に成功する。
+一番右の値を返す。ただし、引数の評価が失敗で返る場合は失敗する。
 
 **Examples**:
 ```lisp
@@ -778,10 +783,11 @@ cdr部にdelayオブジェクトの入ったセルを返す。
 
 **Usage**: `<= numeric...`  
 **Takes**: `numeric...`  
-**Returns**: `boolean`
+**Returns**: `any`
 
 **Description**:
-数値の大小比較（小なりイコール）を行う。
+数値の大小比較（小なりイコール）を行い成り立つ場合に成功する。
+一番右の値を返す。ただし、引数の評価が失敗で返る場合は失敗する。
 
 **Examples**:
 ```lisp
@@ -793,10 +799,11 @@ cdr部にdelayオブジェクトの入ったセルを返す。
 
 **Usage**: `> numeric...`  
 **Takes**: `numeric...`  
-**Returns**: `boolean`
+**Returns**: `any`
 
 **Description**:
-数値の大小比較（大なり）を行う。
+数値の大小比較（大なり）を行い成り立つ場合に成功する。
+一番右の値を返す。ただし、引数の評価が失敗で返る場合は失敗する。
 
 **Examples**:
 ```lisp
@@ -808,10 +815,11 @@ cdr部にdelayオブジェクトの入ったセルを返す。
 
 **Usage**: `>= numeric...`  
 **Takes**: `numeric...`  
-**Returns**: `boolean`
+**Returns**: `any`
 
 **Description**:
-数値の大小比較（大なりイコール）を行う。
+数値の大小比較（大なりイコール）を行い成り立つ場合に成功する。
+一番右の値を返す。ただし、引数の評価が失敗で返る場合は失敗する。
 
 **Examples**:
 ```lisp
@@ -823,10 +831,10 @@ cdr部にdelayオブジェクトの入ったセルを返す。
 
 **Usage**: `not expr`  
 **Takes**: `any`  
-**Returns**: `boolean`
+**Returns**: `any`
 
 **Description**:
-成否を反転する。
+成否を反転する。復帰値は引数をそのまま返す。
 
 **Examples**:
 ```lisp
@@ -838,10 +846,10 @@ cdr部にdelayオブジェクトの入ったセルを返す。
 
 **Usage**: `in value list`  
 **Takes**: `any cell`  
-**Returns**: `boolean`
+**Returns**: `cell`
 
 **Description**:
-集合内包含を判定する。
+集合内包含を判定し、含まれる場合は成功する。valueをcar部にもつ最長の部分リストを返す。
 
 **Examples**:
 ```lisp
@@ -853,7 +861,7 @@ cdr部にdelayオブジェクトの入ったセルを返す。
 
 **Usage**: `~ displayable regex`  
 **Takes**: `displayable displayable`  
-**Returns**: `boolean`
+**Returns**: `()`
 
 **Description**:
 正規表現マッチを行う。
@@ -871,7 +879,7 @@ cdr部にdelayオブジェクトの入ったセルを返す。
 
 **Usage**: `is-list value`  
 **Takes**: `any`  
-**Returns**: `boolean`
+**Returns**: `()`
 
 **Description**:
 値がリスト（cell）かどうかを判定する。
@@ -887,7 +895,7 @@ cdr部にdelayオブジェクトの入ったセルを返す。
 
 **Usage**: `is-empty value`  
 **Takes**: `any`  
-**Returns**: `boolean`
+**Returns**: `()`
 
 **Description**:
 値が空（nil）かどうかを判定する。
@@ -903,7 +911,7 @@ cdr部にdelayオブジェクトの入ったセルを返す。
 
 **Usage**: `is-string value`  
 **Takes**: `any`  
-**Returns**: `boolean`
+**Returns**: `()`
 
 **Description**:
 値が文字列かどうかを判定する。
@@ -919,7 +927,7 @@ cdr部にdelayオブジェクトの入ったセルを返す。
 
 **Usage**: `is-symbol value`  
 **Takes**: `any`  
-**Returns**: `boolean`
+**Returns**: `()`
 
 **Description**:
 値がシンボルかどうかを判定する。
@@ -935,7 +943,7 @@ cdr部にdelayオブジェクトの入ったセルを返す。
 
 **Usage**: `is-variable value`  
 **Takes**: `any`  
-**Returns**: `boolean`
+**Returns**: `()`
 
 **Description**:
 値が変数かどうかを判定する。
@@ -951,7 +959,7 @@ cdr部にdelayオブジェクトの入ったセルを返す。
 
 **Usage**: `is-number value`  
 **Takes**: `any`  
-**Returns**: `boolean`
+**Returns**: `()`
 
 **Description**:
 値が数値かどうかを判定する。
@@ -967,7 +975,7 @@ cdr部にdelayオブジェクトの入ったセルを返す。
 
 **Usage**: `is-buffered value`  
 **Takes**: `any`  
-**Returns**: `boolean`
+**Returns**: `()`
 
 **Description**:
 値がbufferedオブジェクトかどうかを判定する。
@@ -982,7 +990,7 @@ cdr部にdelayオブジェクトの入ったセルを返す。
 
 **Usage**: `is-chars value`  
 **Takes**: `any`  
-**Returns**: `boolean`
+**Returns**: `()`
 
 **Description**:
 値がcharsオブジェクトかどうかを判定する。
@@ -997,7 +1005,7 @@ cdr部にdelayオブジェクトの入ったセルを返す。
 
 **Usage**: `is-file value`  
 **Takes**: `any`  
-**Returns**: `boolean`
+**Returns**: `()`
 
 **Description**:
 値がfileオブジェクトかどうかを判定する。
@@ -1013,7 +1021,7 @@ cdr部にdelayオブジェクトの入ったセルを返す。
 
 **Usage**: `is-atom value`  
 **Takes**: `any`  
-**Returns**: `boolean`
+**Returns**: `()`
 
 **Description**:
 値がアトム（cellではない値）かどうかを判定する。数値、文字列、シンボル、変数、ファイル、辞書などはアトムとして扱われる。
