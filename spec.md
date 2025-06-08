@@ -46,7 +46,7 @@ code = command { command_operator command };
 - **16~23byte**: 即値(数値)又はオブジェクトへのアドレス(所謂cdr部)
 - **24~31byte**: 参照カウント
 
-### 参照型 / 実数 / 辞書型 / file / buffered / chars
+### 参照型 / 実数 / 辞書型 / file / buffered / chars / delay
 - **0~7byte**: 型を示すタグ
 - **8~15byte**: 参照カウント
 - **16~23byte**:
@@ -61,6 +61,8 @@ code = command { command_operator command };
   - **chars**: 以下のデータを含む実装言語のオブジェクトへの参照
     - 次のユニコード文字
     - バッファーIO用のオブジェクト
+  - **delay**: 即値(数値)又はオブジェクトへのアドレス
+
 - **24~31byte**: 予約
 
 ## 値の表現
@@ -72,7 +74,7 @@ code = command { command_operator command };
 - **cell**: cellのアドレスに対し0から数えて60bit目を1とする (8~15byteにアドレス計算なしにアクセスするため)
 - **variable / string**: オブジェクトのアドレス
 - **symbol**: symbolのアドレスに対し0から数えて59bit目を1とする (16~23byteにアドレス計算なしにアクセスするため)
-- **参照型 / 実数 / 辞書型 / buf / chars / file**: オブジェクトのアドレスに対し0から数えて59~60bit目を1とする
+- **参照型 / 実数 / 辞書型 / buf / chars / file / delay**: オブジェクトのアドレスに対し0から数えて59~60bit目を1とする
 
 ## メモリ管理
 
@@ -86,7 +88,7 @@ code = command { command_operator command };
 - **symbol**: abc, @などアルファベットと記号
 - **variable**: $abc, $@, $1など$で始まる文字列
 - **string**: 'abc'などシングルクォーテーションで囲まれた文字列
-- **cell**: (1 2 3), (a . b)など丸括弧とドットを用いたS式
+- **cell**: (1 2 3), (a & b)など丸括弧と&を用いたS式
 
 ## 非終端記号とASTの対応
 
@@ -101,14 +103,14 @@ code = command { command_operator command };
 | quoted | 'abc' |
 | variable | $abc |
 | block | (), (a b c), (do (a b c) (a b c)) |
-| glob | (glob . *) |
-| value | 123, abc, 'abc', $abc, (a b c), (glob . *) |
+| glob | (glob & *) |
+| value | 123, abc, 'abc', $abc, (a b c), (glob & *) |
 | operator | +, >=, \|, \|\|, ; |
 | value_operator | +, >= |
 | expr | (+ 1 2 3) |
-| values | 123, (expand 123 abc 'abc' $abc (a b) (glob . *)) |
+| values | 123, (expand 123 abc 'abc' $abc (a b) (glob & *)) |
 | multi_values | (@ $x) (@ (a b c)) |
-| word | 123, (@ $x), (expand 123 abc (+ 1 2 3) (glob . *)) |
+| word | 123, (@ $x), (expand 123 abc (+ 1 2 3) (glob & *)) |
 | command | (abc 123 (@ $x) (expand 123 abc) (+ 1 2 3)) |
 | command_operator | \|, \|\|, ; |
 | code | (abc 123), (do (a b c) (a b c)) |
@@ -125,6 +127,7 @@ code = command { command_operator command };
 
 数値 / プリミティブ / string / symbol / 実数 / 辞書 / buf / chars / file は即値として評価される。variableは格納された値に評価される。variableは格納された値が参照型の場合、参照先の値に評価される。
 
+※delay型はrest関数により評価前にconsセルに展開されるため、評価されることはない。
 ※参照型はvariableの値としてのみ出現する
 
 ### 式の評価
@@ -134,8 +137,8 @@ code = command { command_operator command };
 演算子が値の場合は値として、式の場合は式として評価される。評価後の値が
 
 - **数値 / string の場合**: 対応するパスをコマンド名として外部コマンドが実行される。この時、引数はすべて評価後に文字列に変換される。
-- **symbolの場合**: symbolの示す関数または特殊形式が呼び出される。symbolの示す関数がない(nil)場合、名前に対応するパスをコマンド名として外部コマンドが実行される。
-- **辞書の場合**: 引数を評価後に文字列に変換した結果をキーとして対応する値に評価する。引数が複数ある場合は以下のASTと等価であるとする。`((dict key1) key2)...`
+- **symbolの場合**: symbolの示す関数または特殊形式が呼び出される。symbolの示す関数がない(nil=())場合、名前に対応するパスをコマンド名として外部コマンドが実行される。
+- **辞書の場合**: 引数が無い場合、keyとvalueが交互に並んだ遅延リストを返す。引数を評価後に文字列に変換した結果をキーとして対応する値に評価する。引数が複数ある場合は次のASTと等価であるとする。`((dict key1) key2)...`
 - **cellの場合**: cellをラムダ式とみなして評価する。この時引数は最初にすべて評価される。
 - **プリミティブ**: 対応するプリミティブ(実装言語の関数)を呼び出す。プリミティブが通常の関数の場合、引数は最初にすべて評価される。プリミティブが特殊形式の場合、引数の評価されるかどうか、タイミング回数はプリミティブにより異なる。
 
@@ -143,15 +146,17 @@ code = command { command_operator command };
 
 #### 数値への変換
 値がsymbol / stringの場合、十進法で解釈して数値への変換を試みる。値が数値でもsymbol / stringでもない場合、または解釈が失敗する場合は例外を上げる。
+以降、数値変換可能な値のグループをnumericと呼ぶ。
 
 #### 文字列への変換
 値が数値、実数の場合は十進法で解釈してstringへ変換する。fileの場合はfdの数値を文字列にして返す。値がsymbol / stringでも上記でもない場合は例外を上げる。
+以降、文字変換可能な値のグループをdisplayableと呼ぶ。
 
 ### 多値の返却
 
 - **演算子が@プリミティブの場合**: 以下の第一引数の戻り値により多値を返却する。
   - **cellの場合**: 線形リストだとみなしてcar部をすべて返却する。例) @( cons 1 ( cons `(1 2) 3 ) ) -> 1 (1 2)
-  - **nilの場合**: 値を返却しない
+  - **()の場合**: 値を返却しない
   - **他の場合**: 戻り値をそのまま返す
 
 - **演算子がglobプリミティブの場合**: パターンに一致するパスを多値返却する。パスがゼロ個の場合は例外を投げる。
@@ -182,13 +187,13 @@ code = command { command_operator command };
 )
 ```
 
-※ グローバルなラムダ式は環境がnilになる。また、マクロはmacシンボルが格納される。
+※ グローバルなラムダ式は環境が()になる。また、マクロはmacシンボルが格納される。
 
 ラムダ式の評価は以下の順序で行われる。束縛の方式は動的スコープと同様。
 
 1. 引数の評価
 2. 環境内のvaliableに参照型の値を束縛する
-3. 引数のsymbolに引数の評価結果を束縛する(引数が足りない場合はnilを束縛) ※symbolに束縛しきれなかった引数は位置パラメータやarg / shiftプリミティブで参照可能
+3. 引数のsymbolに引数の評価結果を束縛する(引数が足りない場合は()を束縛) ※symbolに束縛しきれなかった引数は位置パラメータやarg / shiftプリミティブで参照可能
 4. ボディ部の評価
 5. 束縛したvaliable / symbolの値をリストア
 6. ボディ部の最後のコマンドの戻り値で復帰
@@ -217,7 +222,7 @@ code = command { command_operator command };
 **Examples**:
 ```lisp
 (do (swap $a 1) (swap $a 2))                    ; => 1
-(do (swap $a (cons 1 2)) (swap (car $a) 3) (head $a)) ; => 3
+(do (swap $a (cons 1 2)) (swap (head $a) 3) (head $a)) ; => 3
 ```
 
 #### dynamic
@@ -257,11 +262,11 @@ code = command { command_operator command };
 **Returns**: `any`
 
 **Description**:
-引数を順に評価し、最後の結果を返す。最後の引数以外の結果は$?変数に束縛される。
+引数を順に評価し、最後の結果を返す。最後の引数以外の戻り値は$?変数に束縛される。
 
 **Examples**:
 ```lisp
-(do (echo 'first') (echo 'second') 42)          ; => 42
+(do (echo first) (echo second) 42)          ; => 42
 (do (swap $x 1) (swap $y 2) (+ $x $y))         ; => 3
 ```
 
@@ -272,27 +277,27 @@ code = command { command_operator command };
 **Returns**: `any`
 
 **Description**:
-条件分岐。一番左のcond節が成功した場合はthen節を評価し、その結果で返る。失敗した場合は右隣のcond節then節を同様に評価し、どのcond節も失敗した場合はelse節を評価する。else節がない場合は最後のcond節の結果を返す。
+条件分岐。一番左のcond節が成功した場合はthen節を評価し、その結果で返る。失敗した場合は右隣のcond節then節を同様に評価し、どのcond節も失敗した場合はelse節を評価する。else節がない場合は最後のcond節の結果を返す。cond節の戻り値は$?変数に束縛される。
 
 **Examples**:
 ```lisp
-(if (> 5 3) 'yes' 'no')                        ; => 'yes'
-(if (< 5 3) 'less' (> 5 3) 'greater' 'equal') ; => 'greater'
+(if (> 5 3) yes no)                        ; => yes
+(if (< 5 3) less (> 5 3) greater equal) ; => greater
 ```
 
 #### while
 
 **Usage**: `while cond [body [else]]`  
-**Takes**: `any [command...] [command...]`  
+**Takes**: `any [command] [command]`  
 **Returns**: `any`
 
 **Description**:
-condが成功する限りbodyを繰り返し評価する。condが失敗した場合elseを評価する。復帰値はnil、ただしcontinueおよびbreakに引数が与えられた場合はその値を蓄積したリストを返す。
+condが成功する限りbodyを繰り返し評価する。condが失敗した場合elseを評価する。復帰値は()、ただしcontinueおよびbreakに引数が与えられた場合はその値を蓄積したリストを返す。
 
 **Examples**:
 ```lisp
-(while (< $i 3) (do (echo $i) (swap $i (+ $i 1)))) ; => nil
-(while (< $i 3) (echo $i) (echo 'done'))           ; => nil
+(while (< $i 3) (do (echo $i) (swap $i (+ $i 1)))) ; => ()
+(while (< $i 3) (echo $i) (echo done))           ; => ()
 ```
 
 ##### break
@@ -306,7 +311,7 @@ while ループを抜ける。
 
 **Examples**:
 ```lisp
-(while 1 (if (> $i 5) (break 'exit') (swap $i (+ $i 1)))) ; => exits loop
+(while 1 (if (> $i 5) (break exit) (swap $i (+ $i 1)))) ; => exits loop
 ```
 
 ##### continue
@@ -335,7 +340,7 @@ while ループの次の繰り返しへ。
 **Examples**:
 ```lisp
 (@ (cons 1 (cons 2 3)))                        ; => 1 2
-(echo @(cons 'a' (cons 'b' nil)))              ; => prints 'a b'
+(echo @(cons a (cons b ())))              ; => prints a b
 ```
 
 #### spawn
@@ -349,7 +354,7 @@ while ループの次の繰り返しへ。
 
 **Examples**:
 ```lisp
-(spawn (echo 'background'))                     ; => process-id
+(spawn (echo background))                     ; => process-id
 (spawn (sleep 5))                              ; => process-id
 ```
 
@@ -365,7 +370,7 @@ while ループの次の繰り返しへ。
 **Examples**:
 ```lisp
 (quote (+ 1 2))                                ; => (+ 1 2)
-'(a b c)                                       ; => (a b c)
+(quote (a b c))                                       ; => (a b c)
 ```
 
 #### back-quote
@@ -379,8 +384,8 @@ S式のクォートおよび展開処理。
 
 **Examples**:
 ```lisp
-`(+ 1 ,(+ 2 3))                               ; => (+ 1 5)
-`(list ,@(cons 1 (cons 2 nil)))               ; => (list 1 2)
+(back-quote (+ 1 ~(+ 2 3)))                               ; => (+ 1 5)
+(back-quote (list ~@(cons 1 (cons 2 ()))))               ; => (list 1 2)
 ```
 
 ### その他制御
@@ -425,8 +430,8 @@ S式のクォートおよび展開処理。
 
 **Examples**:
 ```lisp
-(raise error 'something went wrong')           ; => throws exception
-(raise type-error 'expected number')          ; => throws type exception
+(raise error something went wrong)           ; => throws exception
+(raise type-error expected number)          ; => throws type exception
 ```
 
 #### return
@@ -440,7 +445,7 @@ S式のクォートおよび展開処理。
 
 **Examples**:
 ```lisp
-(fn (x) (if (< x 0) (return 'negative') (+ x 1))) ; => early return
+(fn (x) (if (< x 0) (return negative) (+ x 1))) ; => early return
 ```
 
 #### catch
@@ -454,18 +459,18 @@ try部を評価し、例外が上がった場合にhandlerに例外元のraise�
 
 **Examples**:
 ```lisp
-(catch (raise error 'test') (fn (e msg) (echo 'caught:' msg))) ; => prints 'caught: test'
-(catch (+ 1 2) (echo 'error'))                                ; => 3
+(catch (raise error test) (fn (e msg) (echo caught: msg))) ; => prints caught: test
+(catch (+ 1 2) (echo error))                                ; => 3
 ```
 
 #### shift
 
-**Usage**: `shift [number]`  
-**Takes**: `[number]`  
+**Usage**: `shift [numeric]`  
+**Takes**: `[numeric]`  
 **Returns**: `any`
 
 **Description**:
-束縛されなかった引数の内number(デフォルト1)番目の引数を返す。束縛されなかった引数のうち、n番目の引数を n - number 番目に変更する。number番目の引数がない場合は失敗する。
+束縛されなかった引数の内numeric(デフォルト1)番目の引数を返す。束縛されなかった引数のうち、n番目の引数を n - numeric 番目に変更する。numeric番目の引数がない場合は失敗する。
 
 **Examples**:
 ```lisp
@@ -476,7 +481,7 @@ try部を評価し、例外が上がった場合にhandlerに例外元のraise�
 #### arg
 
 **Usage**: `arg [n]`  
-**Takes**: `[number]`  
+**Takes**: `[numeric]`  
 **Returns**: `any`
 
 **Description**:
@@ -505,7 +510,7 @@ try部を評価し、例外が上がった場合にhandlerに例外元のraise�
 #### wait
 
 **Usage**: `wait [pid]`  
-**Takes**: `[number]`  
+**Takes**: `[numeric]`  
 **Returns**: `number`
 
 **Description**:
@@ -543,8 +548,8 @@ try部を評価し、例外が上がった場合にhandlerに例外元のraise�
 
 **Examples**:
 ```lisp
-(trap SIGINT (echo 'interrupted'))            ; => sets interrupt handler
-(trap error (echo 'error occurred'))          ; => sets error handler
+(trap SIGINT (echo interrupted))            ; => sets interrupt handler
+(trap error (echo error occurred))          ; => sets error handler
 ```
 
 #### eval
@@ -558,8 +563,8 @@ S式を評価する。
 
 **Examples**:
 ```lisp
-(eval '(+ 1 2))                               ; => 3
-(eval (cons + (cons 1 (cons 2 nil))))        ; => 3
+(eval (quote (+ 1 2)))                               ; => 3
+(eval (cons + (cons 1 (cons 2 ()))))        ; => 3
 ```
 
 #### macro-expand
@@ -573,30 +578,65 @@ S式を評価する。
 
 **Examples**:
 ```lisp
-(macro-expand '(when (> x 0) (echo x)))       ; => (if (> x 0) (echo x))
+(macro-expand (quote (when (> x 0) (echo x))))       ; => (if (> x 0) (echo x))
 ```
 
 #### fail
 
 **Usage**: `fail`  
 **Takes**: `()`  
-**Returns**: `nil`
+**Returns**: `any`
 
 **Description**:
 ステータス失敗を返す。
 
 **Examples**:
 ```lisp
-(fail)                                         ; => nil (with failure status)
-(if (fail) 'success' 'failure')               ; => 'failure'
+(fail)                                         ; => () (with failure status)
+(if (fail) success failure)               ; => failure
 ```
+
+#### copy
+
+**Usage**: `copy value`  
+**Takes**: `any`  
+**Returns**: `any`
+
+**Description**:
+オブジェクトのディープコピーを返す。
+
+**Examples**:
+```lisp
+(copy (cons 1 2))                             ; => (1 & 2)
+(copy hello)                                 ; => hello
+```
+
+#### delay
+
+**Usage**: `delay function [head]`  
+**Takes**: `any [any]`  
+**Returns**: `cell`
+
+**Description**:
+遅延リストを生成して返す。
+セルのcar部にはheadかheadが無い場合はfunctionを評価した値、
+cdr部にはdelayオブジェクトが入る。
+遅延リストに対しrestを呼び出すとcar部にfunctionを評価した値、
+cdr部にdelayオブジェクトの入ったセルを返す。
+
+**Examples**:
+```lisp
+(delay (fn () (+ 1 2)) 0)                     ; => (0 & delay-object)
+(delay (fn () (+ 1 2)))                       ; => (3 & delay-object)
+```
+
 
 ### 算術 / 論理
 
 #### +
 
-**Usage**: `+ number...`  
-**Takes**: `number...`  
+**Usage**: `+ numeric...`  
+**Takes**: `numeric...`  
 **Returns**: `number`
 
 **Description**:
@@ -611,8 +651,8 @@ S式を評価する。
 
 #### -
 
-**Usage**: `- number...`  
-**Takes**: `number...`  
+**Usage**: `- numeric...`  
+**Takes**: `numeric...`  
 **Returns**: `number`
 
 **Description**:
@@ -626,8 +666,8 @@ S式を評価する。
 
 #### *
 
-**Usage**: `* number...`  
-**Takes**: `number...`  
+**Usage**: `* numeric...`  
+**Takes**: `numeric...`  
 **Returns**: `number`
 
 **Description**:
@@ -642,8 +682,8 @@ S式を評価する。
 
 #### /
 
-**Usage**: `/ number...`  
-**Takes**: `number...`  
+**Usage**: `/ numeric...`  
+**Takes**: `numeric...`  
 **Returns**: `number`
 
 **Description**:
@@ -654,6 +694,21 @@ S式を評価する。
 (/ 12 3 2)                                    ; => 2
 (/ 10 2)                                      ; => 5
 (/ 1 0)                                       ; => error
+```
+
+#### %
+
+**Usage**: `% numeric numeric`  
+**Takes**: `numeric numeric`  
+**Returns**: `number`
+
+**Description**:
+数値の剰余を求める。
+
+**Examples**:
+```lisp
+(% 10 3)                                      ; => 1
+(% 7 2)                                       ; => 1
 ```
 
 #### ==
@@ -669,7 +724,7 @@ S式を評価する。
 ```lisp
 (== 1 1 1)                                    ; => success
 (== 1 2)                                      ; => failure
-(== '123' 123)                                ; => success
+(== 123 123)                                  ; => success
 ```
 
 #### =
@@ -683,9 +738,9 @@ S式を評価する。
 
 **Examples**:
 ```lisp
-(= 'hello' 'hello')                           ; => success
-(= 'a' 'b')                                   ; => failure
-(= 123 '123')                                 ; => success
+(= hello hello)                               ; => success
+(= a b)                                       ; => failure
+(= 123 123)                                   ; => success
 ```
 
 #### is
@@ -706,8 +761,8 @@ S式を評価する。
 
 #### <
 
-**Usage**: `< number...`  
-**Takes**: `number...`  
+**Usage**: `< numeric...`  
+**Takes**: `numeric...`  
 **Returns**: `boolean`
 
 **Description**:
@@ -721,8 +776,8 @@ S式を評価する。
 
 #### <=
 
-**Usage**: `<= number...`  
-**Takes**: `number...`  
+**Usage**: `<= numeric...`  
+**Takes**: `numeric...`  
 **Returns**: `boolean`
 
 **Description**:
@@ -736,8 +791,8 @@ S式を評価する。
 
 #### >
 
-**Usage**: `> number...`  
-**Takes**: `number...`  
+**Usage**: `> numeric...`  
+**Takes**: `numeric...`  
 **Returns**: `boolean`
 
 **Description**:
@@ -751,8 +806,8 @@ S式を評価する。
 
 #### >=
 
-**Usage**: `>= number...`  
-**Takes**: `number...`  
+**Usage**: `>= numeric...`  
+**Takes**: `numeric...`  
 **Returns**: `boolean`
 
 **Description**:
@@ -776,7 +831,7 @@ S式を評価する。
 **Examples**:
 ```lisp
 (not (> 1 2))                                 ; => success
-(not (= 'a' 'a'))                             ; => failure
+(not (= a a))                                 ; => failure
 ```
 
 #### in
@@ -790,14 +845,14 @@ S式を評価する。
 
 **Examples**:
 ```lisp
-(in 'a' (cons 'a' (cons 'b' (cons 'c' nil)))) ; => success
-(in 'd' (cons 'a' (cons 'b' (cons 'c' nil)))) ; => failure
+(in a (cons a (cons b (cons c ())))) ; => success
+(in d (cons a (cons b (cons c ())))) ; => failure
 ```
 
 #### ~
 
-**Usage**: `~ string regex`  
-**Takes**: `string string`  
+**Usage**: `~ displayable regex`  
+**Takes**: `displayable displayable`  
 **Returns**: `boolean`
 
 **Description**:
@@ -805,9 +860,9 @@ S式を評価する。
 
 **Examples**:
 ```lisp
-(~ 'hello' 'h.*o')                            ; => success
-(~ 'world' '^w')                              ; => success
-(~ 'test' 'xyz')                              ; => failure
+(~ hello h.*o)                                ; => success
+(~ world ^w)                                  ; => success
+(~ test xyz)                                  ; => failure
 ```
 
 ### 型チェック
@@ -825,7 +880,7 @@ S式を評価する。
 ```lisp
 (is-list (cons 1 2))                          ; => success
 (is-list 123)                                 ; => failure
-(is-list nil)                                 ; => success
+(is-list ())                                  ; => success
 ```
 
 #### is-empty
@@ -839,9 +894,9 @@ S式を評価する。
 
 **Examples**:
 ```lisp
-(is-empty nil)                                ; => success
+(is-empty ())                                 ; => success
 (is-empty 0)                                  ; => failure
-(is-empty '')                                 ; => failure
+(is-empty ())                                 ; => success
 ```
 
 #### is-string
@@ -855,9 +910,9 @@ S式を評価する。
 
 **Examples**:
 ```lisp
-(is-string 'hello')                           ; => success
+(is-string hello)                             ; => success
 (is-string 123)                               ; => failure
-(is-string 'symbol)                           ; => failure
+(is-string symbol)                            ; => failure
 ```
 
 #### is-symbol
@@ -871,8 +926,8 @@ S式を評価する。
 
 **Examples**:
 ```lisp
-(is-symbol 'hello)                            ; => success
-(is-symbol 'hello')                           ; => failure
+(is-symbol hello)                             ; => success
+(is-symbol hello)                             ; => failure
 (is-symbol 123)                               ; => failure
 ```
 
@@ -888,7 +943,7 @@ S式を評価する。
 **Examples**:
 ```lisp
 (is-variable $x)                              ; => success
-(is-variable 'x)                              ; => failure
+(is-variable x)                               ; => failure
 (is-variable 123)                             ; => failure
 ```
 
@@ -905,7 +960,7 @@ S式を評価する。
 ```lisp
 (is-number 123)                               ; => success
 (is-number -45)                               ; => success
-(is-number '123')                             ; => failure
+(is-number 123)                               ; => failure
 ```
 
 #### is-buffered
@@ -919,8 +974,8 @@ S式を評価する。
 
 **Examples**:
 ```lisp
-(is-buffered (buf 'hello'))                   ; => success
-(is-buffered 'hello')                         ; => failure
+(is-buffered (buf hello))                     ; => success
+(is-buffered hello)                           ; => failure
 ```
 
 #### is-chars
@@ -934,8 +989,8 @@ S式を評価する。
 
 **Examples**:
 ```lisp
-(is-chars (chars 'hello'))                    ; => success
-(is-chars 'hello')                            ; => failure
+(is-chars (chars hello))                      ; => success
+(is-chars hello)                              ; => failure
 ```
 
 #### is-file
@@ -949,9 +1004,9 @@ S式を評価する。
 
 **Examples**:
 ```lisp
-(is-file (open 'test.txt'))                   ; => success
+(is-file (open test.txt))                     ; => success
 (is-file STDOUT)                              ; => success
-(is-file 'hello')                             ; => failure
+(is-file hello)                               ; => failure
 ```
 
 #### is-atom
@@ -966,29 +1021,29 @@ S式を評価する。
 **Examples**:
 ```lisp
 (is-atom 123)                                 ; => success
-(is-atom 'hello')                             ; => success
-(is-atom 'symbol)                             ; => success
+(is-atom hello)                               ; => success
+(is-atom symbol)                              ; => success
 (is-atom (cons 1 2))                          ; => failure
-(is-atom nil)                                 ; => success
+(is-atom ())                                  ; => success
 ```
 
 ### リスト操作
 
 #### cons
 
-**Usage**: `cons [car [cdr]]`  
-**Takes**: `[any [any]]`  
+**Usage**: `cons [car [cdr]...]`  
+**Takes**: `[any [any]...]`  
 **Returns**: `cell`
 
 **Description**:
-cellを構築する。引数が0個の場合は `(cons nil nil)` と等価。引数が1個の場合は `(cons car nil)` と等価。引数が3個以上の場合は `(cons a (cons b c))` のように右結合で展開される。
+cellを構築する。引数が0個の場合は `(cons () ())` と等価。引数が1個の場合は `(cons car ())` と等価。引数が3個以上の場合は `(cons a (cons b c))` のように右結合で展開される。
 
 **Examples**:
 ```lisp
-(cons 1 2)                                    ; => (1 . 2)
-(cons 1)                                      ; => (1 . nil)
-(cons)                                        ; => (nil . nil)
-(cons 1 2 3)                                  ; => (1 . (2 . 3))
+(cons 1 2)                                    ; => (1 & 2)
+(cons 1)                                      ; => (1 & ())
+(cons)                                        ; => (() & ())
+(cons 1 2 3)                                  ; => (1 & (2 & 3))
 ```
 
 #### head
@@ -998,14 +1053,13 @@ cellを構築する。引数が0個の場合は `(cons nil nil)` と等価。引
 **Returns**: `any`
 
 **Description**:
-リストの先頭要素（car部）を返す。引数がnilの場合はnilを返す。引数がcellでない場合は例外を発生させる。
+リストの先頭要素（car部）を返す。引数がcellでない場合(空リストを含む)は失敗し引数を返す。
 
 **Examples**:
 ```lisp
 (head (cons 1 2))                             ; => 1
-(head (cons 'a' (cons 'b' nil)))              ; => 'a'
-(head nil)                                    ; => nil
-(head 123)                                    ; => error
+(head (cons a (cons b ())))                   ; => a
+(head ())                                     ; => ()
 ```
 
 #### rest
@@ -1015,31 +1069,13 @@ cellを構築する。引数が0個の場合は `(cons nil nil)` と等価。引
 **Returns**: `any`
 
 **Description**:
-リストの残り部分（cdr部）を返す。引数がnilの場合はnilを返す。引数がcellでない場合は例外を発生させる。
+リストの残り部分（cdr部）を返す。引数がcellでない場合(空リストを含む)は失敗し引数を返す。
 
 **Examples**:
 ```lisp
 (rest (cons 1 2))                             ; => 2
-(rest (cons 'a' (cons 'b' nil)))              ; => ('b' . nil)
-(rest nil)                                    ; => nil
-(rest 123)                                    ; => error
-```
-
-#### each
-
-**Usage**: `each symbol collection body`  
-**Takes**: `cell`  
-**Returns**: `any`
-
-**Description**:
-リストの残り部分（cdr部）を返す。引数がnilの場合はnilを返す。引数がcellでない場合は例外を発生させる。
-
-**Examples**:
-```lisp
-(rest (cons 1 2))                             ; => 2
-(rest (cons 'a' (cons 'b' nil)))              ; => ('b' . nil)
-(rest nil)                                    ; => nil
-(rest 123)                                    ; => error
+(rest (cons a (cons b ())))                   ; => (b & ())
+(rest ())                                     ; => ()
 ```
 
 ### 辞書操作
@@ -1056,8 +1092,8 @@ cellを構築する。引数が0個の場合は `(cons nil nil)` と等価。引
 **Examples**:
 ```lisp
 (dict)                                        ; => {}
-(dict 'name' 'Alice' 'age' 30)                ; => {'name': 'Alice', 'age': 30}
-(dict 1 'one' 2 'two')                        ; => {1: 'one', 2: 'two'}
+(dict name Alice age 30)                      ; => {name: Alice, age: 30}
+(dict 1 one 2 two)                            ; => {1: one, 2: two}
 ```
 
 #### del
@@ -1071,41 +1107,26 @@ cellを構築する。引数が0個の場合は `(cons nil nil)` と等価。引
 
 **Examples**:
 ```lisp
-(del (dict 'a' 1 'b' 2) 'a')                 ; => {'b': 2}
-(del (dict 'a' 1) 'c')                       ; => {'a': 1}
-```
-
-#### keys
-
-**Usage**: `keys dict`  
-**Takes**: `dict`  
-**Returns**: `cell`
-
-**Description**:
-辞書のすべてのキーを線形リストで返す。キーの順序は保証されない。
-
-**Examples**:
-```lisp
-(keys (dict 'a' 1 'b' 2))                    ; => ('a' 'b') or ('b' 'a')
-(keys (dict))                                 ; => nil
+(del (dict a 1 b 2) a)                        ; => {b: 2}
+(del (dict a 1) c)                            ; => {a: 1}
 ```
 
 ### 文字列操作
 
 #### split
 
-**Usage**: `split string [regex [count]]`  
-**Takes**: `string [string [number]]`  
+**Usage**: `split displayable [regex [count]]`  
+**Takes**: `displayable [displayable [numeric]]`  
 **Returns**: `cell`
 
 **Description**:
-文字列を区切り文字（正規表現）で分割する。regexが省略された場合は文字コードのリストを返す。countは最大分割数の上限。
+文字列を区切り文字（正規表現）で分割する。regexが省略されたまたは空文字列の場合は文字コードのリストを返す。countは分割数の上限。
 
 **Examples**:
 ```lisp
-(split 'a,b,c' ',')                          ; => ('a' 'b' 'c')
-(split 'hello')                              ; => (104 101 108 108 111)
-(split 'a,b,c,d' ',' 2)                      ; => ('a' 'b,c,d')
+(split a,b,c ,)                               ; => (a b c)
+(split hello)                                 ; => (104 101 108 108 111)
+(split a,b,c,d , 2)                           ; => (a b,c,d)
 ```
 
 #### expand
@@ -1119,16 +1140,16 @@ cellを構築する。引数が0個の場合は `(cons nil nil)` と等価。引
 
 **Examples**:
 ```lisp
-(expand 'a' 'b' 'c')                         ; => 'abc'
-(expand 'a' (glob '*'))                      ; => 'a.txt' 'a.img' (if *.txt, *.img exist)
-(expand (cons 'a' (cons 'b' nil)) 1 
-        (cons 'c' (cons 'd' nil)))           ; => ('a1c' 'a1d' 'b1c' 'b1d')
+(expand a b c)                                ; => abc
+(expand a *)                                  ; => a.txt a.img (if *.txt, *.img exist)
+(expand (cons a (cons b ())) 1 
+        (cons c (cons d ())))                 ; => (a1c a1d b1c b1d)
 ```
 
 #### str
 
 **Usage**: `str code...`  
-**Takes**: `number...`  
+**Takes**: `numeric...`  
 **Returns**: `string`
 
 **Description**:
@@ -1136,90 +1157,88 @@ cellを構築する。引数が0個の場合は `(cons nil nil)` と等価。引
 
 **Examples**:
 ```lisp
-(str 65 66 67)                               ; => 'ABC'
-(str 72 101 108 108 111)                     ; => 'Hello'
-(str)                                        ; => ''
+(str 65 66 67)                                ; => ABC
+(str 72 101 108 108 111)                      ; => Hello
+(str)                                         ; => 
 ```
 
 ### 入出力
 
 #### read-line
 
-**Usage**: `read-line [input]`  
-**Takes**: `[file|buffered]`  
+**Usage**: `read-line`  
+**Takes**: `()`  
 **Returns**: `string`
 
 **Description**:
-STDINまたは指定されたオブジェクトから1行読み取る。改行文字は含まれない。EOFの場合はnilを返す。
+STDINのfileまたはbufferedオブジェクトから1行読み取る。改行文字は含まれない。EOFの場合は失敗し()を返す。
 
 **Examples**:
 ```lisp
 (read-line)                                  ; => reads from STDIN
-(read-line (open 'test.txt'))                ; => reads from file
 ```
 
 #### parse
 
-**Usage**: `parse [input]`  
-**Takes**: `[chars]`  
+**Usage**: `parse`  
+**Takes**: `()`  
 **Returns**: `any`
 
 **Description**:
-STDINまたは指定されたcharsオブジェクトからS式をパースして返す。パースエラーの場合は例外を発生させる。
+STDINのcharsオブジェクトからS式をパースして返す。パースエラーの場合は失敗し()を返す。
 
 **Examples**:
 ```lisp
-(parse (chars '(+ 1 2)'))                   ; => (+ 1 2)
-(parse (chars '123'))                        ; => 123
+((dynamic (STDIN) (parse)) (chars '(+ 1 2)')) ; => (+ 1 2)
 ```
 
 #### cur-line
 
-**Usage**: `cur-line [input]`  
-**Takes**: `[chars]`  
+**Usage**: `cur-line`  
+**Takes**: `()`  
 **Returns**: `number`
 
 **Description**:
-STDINまたは指定されたcharsオブジェクトの現在の行位置を返す（1ベース）。
+STDINのcharsオブジェクトの現在の行位置を返す（1ベース）。
 
 **Examples**:
 ```lisp
-(cur-line (chars 'line1\nline2'))            ; => 1 (initially)
+((dynamic (STDIN) (cur-line)) (chars ABC))            ; => 1 (initially)
+
 ```
 
 #### peekc
 
-**Usage**: `peekc [input]`  
-**Takes**: `[chars]`  
+**Usage**: `peekc`  
+**Takes**: `()`  
 **Returns**: `number`
 
 **Description**:
-STDINまたは指定されたcharsオブジェクトから次の文字を参照して文字コードを返す。読み取り位置は進まない。EOFの場合は-1を返す。
+STDINのcharsオブジェクトから次の文字を参照して文字コードを返す。読み取り位置は進まない。EOFの場合は失敗し()を返す。
 
 **Examples**:
 ```lisp
-(peekc (chars 'ABC'))                        ; => 65 (character 'A')
+((dynamic (STDIN) (peekc)) (chars ABC))  ; => 65 (character 'A')
 ```
 
 #### readb
 
-**Usage**: `readb [input]`  
-**Takes**: `[file|buffered]`  
+**Usage**: `readb`  
+**Takes**: `()`  
 **Returns**: `number`
 
 **Description**:
-STDINまたは指定されたオブジェクトから1バイト読み取って数値を返す。EOFの場合は-1を返す。
+STDINのfileまたはbufferedオブジェクトから1バイト読み取って数値を返す。EOFの場合は失敗し()を返す。
 
 **Examples**:
 ```lisp
-(readb)                                      ; => reads byte from STDIN
-(readb (open 'binary.dat'))                  ; => reads from file
+((dynamic (STDIN) (readb)) (chars ABC))                                      ; => 65
 ```
 
 #### readc
 
-**Usage**: `readc [input]`  
-**Takes**: `[chars]`  
+**Usage**: `readc`  
+**Takes**: `()`  
 **Returns**: `number`
 
 **Description**:
@@ -1227,53 +1246,53 @@ STDINまたは指定されたcharsオブジェクトから1文字読み取って
 
 **Examples**:
 ```lisp
-(readc (chars 'ABC'))                        ; => 65, next readc returns 66
+((dynamic (STDIN) (readc)) (chars ABC))  ; => 65 (character 'A')
 ```
 
 #### echo
 
-**Usage**: `echo [value...] [> output]`  
-**Takes**: `[any...] [file|buffered]`  
-**Returns**: `nil`
+**Usage**: `echo [value...]`  
+**Takes**: `[any...]`  
+**Returns**: `()`
 
 **Description**:
 STDOUTまたは指定されたオブジェクトに値を文字列変換して出力し、改行する。引数間にはIFSに設定された値を挟み込む。
 
 **Examples**:
 ```lisp
-(echo 'Hello' 'World')                       ; => prints 'Hello World\n'
-(echo 123 456)                               ; => prints '123 456\n'
-(echo 'test' > (open 'output.txt' 'w'))      ; => writes to file
+(echo Hello World)                           ; => prints Hello World\n
+(echo 123 456)                               ; => prints 123 456\n
+(echo test > (open output.txt w))            ; => writes to file
 ```
 
 #### print
 
-**Usage**: `print [value...] [> output]`  
-**Takes**: `[any...] [file|buffered]`  
-**Returns**: `nil`
+**Usage**: `print [value...]`  
+**Takes**: `[any...]`  
+**Returns**: `()`
 
 **Description**:
 STDOUTまたは指定されたオブジェクトに値を文字列変換して出力する。改行は追加されない。引数間にはIFSに設定された値を挟み込む。
 
 **Examples**:
 ```lisp
-(print 'Hello' 'World')                      ; => prints 'HelloWorld' (no newline)
-(print 123 ' + ' 456 ' = ' (+ 123 456))     ; => prints '123 + 456 = 579'
+(print Hello World)                          ; => prints HelloWorld (no newline)
+(print 123 + 456 = (+ 123 456))              ; => prints 123 + 456 = 579
 ```
 
 #### show
 
-**Usage**: `show [value...] [> output]`  
-**Takes**: `[any...] [file|buffered]`  
-**Returns**: `nil`
+**Usage**: `show [value...]`  
+**Takes**: `[any...]`  
+**Returns**: `()`
 
 **Description**:
 STDOUTまたは指定されたオブジェクトに値をデバッグ形式で出力する。リストは S式形式、文字列はクォート付きで表示される。
 
 **Examples**:
 ```lisp
-(show (cons 1 2))                            ; => prints '(1 . 2)'
-(show 'hello' 123)                           ; => prints '\'hello\' 123'
+(show (cons 1 2))                            ; => prints (1 & 2)
+(show hello 123)                             ; => prints hello 123
 ```
 
 #### pipe
@@ -1287,16 +1306,16 @@ STDOUTまたは指定されたオブジェクトに値をデバッグ形式で�
 
 **Examples**:
 ```lisp
-(pipe)                                       ; => (read-fd . write-fd)
+(pipe)                                       ; => (read-fd write-fd)
 (let (p (pipe))
-  (echo 'test' > (cdr p))
-  (read-line (car p)))                       ; => 'test'
+  (echo test > (rest p))
+  (read-line (head p)))                      ; => test
 ```
 
 #### buf
 
 **Usage**: `buf source`  
-**Takes**: `file|string`  
+**Takes**: `file|displayable`  
 **Returns**: `buffered`
 
 **Description**:
@@ -1304,29 +1323,29 @@ fileオブジェクトまたは文字列からbufferedオブジェクトを生�
 
 **Examples**:
 ```lisp
-(buf (open 'test.txt'))                      ; => buffered file object
-(buf 'hello world')                          ; => buffered string object
+(buf (open test.txt))                        ; => buffered file object
+(buf hello world)                            ; => buffered string object
 ```
 
 #### chars
 
 **Usage**: `chars source`  
-**Takes**: `file|string`  
+**Takes**: `file|displayable`  
 **Returns**: `chars`
 
 **Description**:
-fileオブジェクトまたは文字列からcharsオブジェクトを生成する。ユニコード文字を一文字ずつ取り出すためのオブジェクト。
+fileオブジェクトまたは文字列からユニコード文字を一文字ずつ取り出すためのcharsオブジェクトを生成する。
 
 **Examples**:
 ```lisp
-(chars 'Hello')                              ; => chars object for 'Hello'
-(chars (open 'utf8.txt'))                    ; => chars object for file
+(chars Hello)                                ; => chars object for Hello
+(chars (open utf8.txt))                      ; => chars object for file
 ```
 
 #### open
 
 **Usage**: `open [filename [mode]]`  
-**Takes**: `[string [string]]`  
+**Takes**: `[displayable [displayable]]`  
 **Returns**: `file`
 
 **Description**:
@@ -1334,106 +1353,23 @@ fileオブジェクトまたは文字列からcharsオブジェクトを生成�
 
 **Examples**:
 ```lisp
-(open 'test.txt')                            ; => opens for reading
-(open 'output.txt' 'w')                      ; => opens for writing
+(open test.txt)                              ; => opens for reading
+(open output.txt w)                          ; => opens for writing
 (open)                                       ; => creates temporary file
 ```
 
 #### env-var
 
-**Usage**: `env-var name`  
-**Takes**: `string`  
+**Usage**: `env-var name [default]`  
+**Takes**: `displayable [displayable]`  
 **Returns**: `string`
 
 **Description**:
-環境変数を参照してstringオブジェクトを生成して返す。環境変数が存在しない場合は失敗しnilを返す。
+環境変数を参照してstringオブジェクトを生成して返す。環境変数が存在しない場合は失敗し()を返す。
 
 **Examples**:
 ```lisp
-(env-var 'HOME')                             ; => '/home/user'
-(env-var 'UNKNOWN_VAR' 'default')            ; => 'default'
-(env-var 'PATH')                             ; => PATH環境変数の値
-```
-
-### 特殊なシンボル
-
-- **STDOUT**: 初期値はfd番号1のfileオブジェクト
-- **STDIN**: 初期値はfd番号0のfileオブジェクト
-- **STDERR**: 初期値はfd番号2のfileオブジェクト
-- **IFS**: 初期値はスペースのシンボル
-
-## サンプルコード
-
-```lisp
-(def next-token ()
-  (swap PEEK-TOKEN (or (read-brank) (read-op) (parse)))
-
-(def read-op ()
-    (if (char #;) SEMI-COLON
-        (char #() PAREN-L
-        (char #)) PAREN-R
-        (or (read-back-quoted) (read-operator)))
-
-(def char (c)
-  (if (== (peekc) $c) (next-char)))
-
-(def one-of (cs)
-  (if (in (peekc) $cs) (next-char)))
-
-(def none-of (cs)
-  (if (not (in (peekc) $cs)) (next-char)))
-
-(def read-brank ()
-  (if (in (peekc) `(#\s #\t ## #\n))
-    (do (while (one-of `(#\s #\t))
-          (and (char ##) (while (none-of `(#\n)))
-          (if (char #\n)
-              (do (read-brank) NEWLINE)
-              SPACE))))
-
-(def read-back-quoted ()
-  (if (char #`)
-      (let (result (intern (str @(while (none-of `(#`)) (collect $?)))))
-        (or (char #`) (fatal 'need closing '`''))
-        $result)))
-
-(swap OPERATOR-CHARS `(#; #& #| #@ #> #<))
-(def read-operator ()
-  (if (in (peek) $OPERATOR-CHARS)
-      (intern (str @(while (one-of $OPERATOR-CHARS) (collect $?))))))))
-
-(def parse-right (op power)
-  (token SPASE)
-  (if (token $op)
-    (do (token NEWLINE)
-         (cons (or (parse $power) (fatal 'need right expression for ' $op)) (parse-right $op $power))
-    $NIL))
-
-(def parse-left (power)
-  (token SPASE)
-  (if ($PREFIX $PEEK-TOKEN)
-    (let ((op power end) $?)
-         (next-token)
-         (token NEWLINE)
-          (let (result (cons $op (parse $power)))
-            (end)
-            $result))))
-    (next-token)
-
-(def token (sym)
-  (if (== $PEEK-TOKEN $sym)
-    (next-token))
-
-(def fatal ()
-  (raise parse-error (expand (cur-line) ': ' $@)))
-
-(def parse (power)
-  (let (left (parse-left power))
-    (token SPASE)
-    (while ($INFIX $PEEK-TOKEN)
-        (let ((op power) $?)
-          (next-token)
-          (token NEWLINE)
-          (swap left (cons $op (parse-right $PEEK-TOKEN $power))
-    $left)))
+(env-var HOME)                               ; => /home/user
+(env-var UNKNOWN_VAR)                        ; => () (failure)
+(env-var PATH)                               ; => PATH environment variable value
 ```
