@@ -1,0 +1,64 @@
+(set (func mac) `(mac (name args)
+  ^(set (func ~$name) `(mac ~$args ~$@))))
+
+(mac def (name args)
+  ^(set (func ~$name) (fn ~$args ~$@)))
+
+(def odd-part (xs)
+  (if (is-atom $xs)
+    ()
+    (cons (head $xs) (if (is-atom (rest $xs))
+      ()
+      (odd-part (rest (rest $xs))))))) 
+
+(mac even-part (xs)
+  ^(odd-part (rest ~$xs)))
+
+(mac let (args)
+  ^((dynamic ~(odd-part $args) ~$@) ~@(even-part $args)))
+
+(mac let@ (args val)
+  ^((dynamic ~$args ~$@) @~$val))
+
+(mac result (test)
+  ^(if ~$test (cons t $? ()) (cons f $? ())))
+    
+(mac assert (is-pass expect test)
+  ^(assert- ~$is-pass ~$expect `~$test))
+
+(mac and (test)
+  (and- $test (arg)))
+
+(def and- (test rest)
+  (if (is-atom $rest) $test ^(if ~$test ~(and- (head $rest) (rest $rest)))))
+
+(def same (xs ys f)
+  (if (= $f ()) (set $f =))
+  (if (is-atom  $xs) 
+    (if (is-atom $ys) ($f $xs $ys))
+    (if (not (is-atom $ys))
+      (and (same (head $xs) (head $ys))
+           (same (rest $xs) (rest $ys))))))
+
+(mac handle ()
+  (if (= (head $2) fn)
+    ^(with-handler ~$1 ~(cons dynamic (rest $2)))
+    ^(with-handler ~$@)))
+
+(def assert- (expect-status expect-ret test)
+  (handle
+    (let@ (given-status given-ret)
+      (handle (result (eval $test))  
+        (fn (e msg) (if (is $expect-status $e)
+          (show PASS: $test: msg = $msg)
+          (do (show ERROR: $test)
+            (show ' ' givien-status = $e expect-status = $expect-status)
+            (show ' ' msg = $msg)))
+          (raise ret)))
+      (if (and (is $given-status $expect-status) (same $given-ret $expect-ret))
+        (show PASS: $test)
+        (do (show ERROR: $test)
+            (show ' ' givien-status = $given-status expect-status = $expect-status)
+            (show ' ' givien-ret = $given-ret expect-ret = $expect-ret))))
+    (fn (e msg) (if (not (is $e ret)) (raise $e $msg)))))
+

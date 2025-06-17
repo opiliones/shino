@@ -210,29 +210,32 @@ code = command { command_operator command };
 
 ### 特殊形式
 
-#### swap
+#### set
 
-**Usage**: `swap variable value`  
-**Takes**: `variable any`  
+**Usage**: `set place newvalue`  
+**Takes**: `{variable|getter command} any`  
 **Returns**: `any`
 
 **Description**:
-第一引数の値の参照元に第二引数の評価結果を設定し、元の値を返す。
+第一引数の値の参照場所を第二引数の評価結果で更新し、更新前の値を返す。
+newvalueの評価が失敗を返した場合は失敗する。
 
 **Examples**:
 ```lisp
-(do (swap $a 1) (swap $a 2))                    ; => 1
-(do (swap $a (cons 1 2)) (swap (head $a) 3) (head $a)) ; => 3
+(do (set $a 1) (set $a 2))                    ; => 1
+(do (set $a (cons 1 2)) (set (head $a) 3) (head $a)) ; => 3
 ```
 
 #### dynamic
 
 **Usage**: `dynamic (arg...) body...`  
 **Takes**: `(symbol...) command...`  
-**Returns**: `any`
+**Returns**: `cell`
 
 **Description**:
-ラムダ式を構築する特殊形式の内、環境を作成しないもの。その場で呼び出されるラムダ式を想定（letと等価）。macro-expandの延長でのスコープ解析により `(() (arg ...) body...)` に置換される。
+ラムダ式を構築する特殊形式の内、環境を作成しないもの。その場で呼び出されるラムダ式を想定（letと等価）。
+macro-expandの延長でのスコープ解析により `(dynamic (arg ...) body...)` に置換される。
+body内でreturnを行った場合、dynamicの式ではなく外側の関数を脱出する。
 
 **Examples**:
 ```lisp
@@ -267,7 +270,7 @@ code = command { command_operator command };
 **Examples**:
 ```lisp
 (do (echo first) (echo second) 42)          ; => 42
-(do (swap $x 1) (swap $y 2) (+ $x $y))         ; => 3
+(do (set $x 1) (set $y 2) (+ $x $y))         ; => 3
 ```
 
 #### if
@@ -281,23 +284,35 @@ code = command { command_operator command };
 
 **Examples**:
 ```lisp
-(if (> 5 3) yes no)                        ; => yes
-(if (< 5 3) less (> 5 3) greater equal) ; => greater
+(if (\> 5 3) yes no)                        ; => yes
+(if (\< 5 3) less (\> 5 3) greater equal) ; => greater
 ```
 
 #### while
 
-**Usage**: `while cond [body [else]]`  
-**Takes**: `any [command] [command]`  
-**Returns**: `any`
+**Usage**: `while cond [body...]`  
+**Takes**: `any [command...]`  
+**Returns**: `cell`
 
 **Description**:
-condが成功する限りbodyを繰り返し評価する。condが失敗した場合elseを評価する。復帰値は()、ただしcontinueおよびbreakに引数が与えられた場合はその値を蓄積したリストを返す。
+condが成功する限りbodyを繰り返し評価する。
+復帰値は()、ただしcontinueおよびbreakに引数が与えられた場合はその値を蓄積したリストを返す。
+最後に評価したbodyが失敗した場合は失敗、その他の場合は成功で返る。
 
 **Examples**:
 ```lisp
-(while (< $i 3) (do (echo $i) (swap $i (+ $i 1)))) ; => ()
-(while (< $i 3) (echo $i) (echo done))           ; => ()
+(set $i 0)
+(while (\< $i 3) (echo $i) (set $i (+ $i 1)))
+0
+1
+2　                                           　　　  ; => ()
+(set $i 0)
+(while (\< $i 3) (echo $i) (break done))
+0
+1
+2                                                 ; => (done)
+(set $i 0)
+(while (\< $i 3) (continue (set $i (+ $i 1))))     ; => (0 1 2)
 ```
 
 ##### break
@@ -311,7 +326,7 @@ while ループを抜ける。
 
 **Examples**:
 ```lisp
-(while 1 (if (> $i 5) (break exit) (swap $i (+ $i 1)))) ; => exits loop
+(while 1 (if (\> $i 5) (break exit) (set $i (+ $i 1)))) ; => exits loop
 ```
 
 ##### continue
@@ -325,7 +340,7 @@ while ループの次の繰り返しへ。
 
 **Examples**:
 ```lisp
-(while (< $i 10) (if (== (% $i 2) 0) (continue) (echo $i))) ; => prints odd numbers
+(while (\< $i 10) (if (== (% $i 2) 0) (continue) (echo $i))) ; => prints odd numbers
 ```
 
 #### @
@@ -339,7 +354,6 @@ while ループの次の繰り返しへ。
 
 **Examples**:
 ```lisp
-(@ (cons 1 (cons 2 3)))                        ; => 1 2
 (echo @(cons a (cons b ())))              ; => prints a b
 ```
 
@@ -405,7 +419,7 @@ S式のクォートおよび展開処理。
 (func echo)                                    ; => function object for echo
 ```
 
-#### env
+#### cap
 
 **Usage**: `env symbol...`  
 **Takes**: `symbol...`  
@@ -416,7 +430,7 @@ S式のクォートおよび展開処理。
 
 **Examples**:
 ```lisp
-(env x y)                                      ; => (ref($x) $x ref($y) $y)
+(cap x y)                                      ; => (ref($x) $x ref($y) $y)
 ```
 
 #### raise
@@ -430,8 +444,8 @@ S式のクォートおよび展開処理。
 
 **Examples**:
 ```lisp
-(raise error something went wrong)           ; => throws exception
-(raise type-error expected number)          ; => throws type exception
+(raise error 'something went wrong')          ; => throws exception
+(raise type-error expected number')          ; => throws type exception
 ```
 
 #### return
@@ -445,22 +459,34 @@ S式のクォートおよび展開処理。
 
 **Examples**:
 ```lisp
-(fn (x) (if (< x 0) (return negative) (+ x 1))) ; => early return
+(fn (x) (if (\< x 0) (return negative) (+ x 1))) ; => early return
 ```
 
-#### catch
+#### handle
 
-**Usage**: `catch try handler`  
+**Usage**: `handle try handler`  
 **Takes**: `command command`  
 **Returns**: `any`
 
 **Description**:
 try部を評価し、例外が上がった場合にhandlerに例外元のraiseの引数を渡して評価する。
 
+組み込みの例外一覧
+- argument-error: 引数の数が不正
+- type-error: 引数の型が不正
+- io-error: I/Oエラーが発生
+- systemcall-error: システムコールがエラーを返した
+- regex-error: 不正な正規表現を検出
+- context-error: 不正な位置からの復帰
+- glob-error: 不正なグロブパターンを検出
+- encode-error:　文字コードの変換に失敗
+- parse-error: 文法エラー
+- zero-division-error: 0割が発生 
+
 **Examples**:
 ```lisp
-(catch (raise error test) (fn (e msg) (echo caught: msg))) ; => prints caught: test
-(catch (+ 1 2) (echo error))                                ; => 3
+(handle (raise error test) (fn (e msg) (echo caught: msg))) ; => prints caught: test
+(handle (+ 1 2) (echo error))                               ; => 3
 ```
 
 #### shift
@@ -507,19 +533,18 @@ try部を評価し、例外が上がった場合にhandlerに例外元のraise�
 (argc)                                         ; => number of unbound arguments
 ```
 
-#### wait
+#### wait-pid
 
-**Usage**: `wait [pid]`  
-**Takes**: `[numeric]`  
+**Usage**: `wait-pid pid`  
+**Takes**: `numeric`  
 **Returns**: `number`
 
 **Description**:
-プロセスの終了を待機する。pidがない場合はspawnが生成したすべてのプロセスを待機。
+プロセスの終了を待機する。
 
 **Examples**:
 ```lisp
-(wait 1234)                                    ; => wait for specific process
-(wait)                                         ; => wait for all spawned processes
+(wait-pid 1234)                                    ; => wait for specific process
 ```
 
 #### gensym
@@ -578,13 +603,13 @@ S式を評価する。
 
 **Examples**:
 ```lisp
-(macro-expand (quote (when (> x 0) (echo x))))       ; => (if (> x 0) (echo x))
+(macro-expand (quote (when (\> x 0) (echo x))))       ; => (if (> x 0) (echo x))
 ```
 
 #### fail
 
-**Usage**: `fail`  
-**Takes**: `()`  
+**Usage**: `fail any`  
+**Takes**: `any`  
 **Returns**: `any`
 
 **Description**:
@@ -592,8 +617,8 @@ S式を評価する。
 
 **Examples**:
 ```lisp
-(fail)                                         ; => () (with failure status)
-(if (fail) success failure)               ; => failure
+(fail)                                      ; => () (with failure status)
+(if (fail 1) success $?)              　　　　　 ; => 1
 ```
 
 #### copy
@@ -608,7 +633,7 @@ S式を評価する。
 **Examples**:
 ```lisp
 (copy (cons 1 2))                             ; => (1 & 2)
-(copy hello)                                 ; => hello
+(copy hello)                             　    ; => hello
 ```
 
 #### delay
@@ -675,9 +700,9 @@ cdr部にdelayオブジェクトの入ったセルを返す。
 
 **Examples**:
 ```lisp
-(* 2 3 4)                                     ; => 24
-(* 5 -2)                                      ; => -10
-(*)                                           ; => 1
+(\* 2 3 4)                                     ; => 24
+(\* 5 -2)                                      ; => -10
+(\*)                                           ; => 1
 ```
 
 #### /
@@ -709,6 +734,36 @@ cdr部にdelayオブジェクトの入ったセルを返す。
 ```lisp
 (% 10 3)                                      ; => 1
 (% 7 2)                                       ; => 1
+```
+
+#### int
+
+**Usage**: `int numeric`  
+**Takes**: `numeric`  
+**Returns**: `integer`
+
+**Description**:
+値を整数に変換する。
+
+**Examples**:
+```lisp
+(int 1.2)                                     ; => 1
+(int (/ 3.0 2))                               ; => 1
+```
+
+#### float
+
+**Usage**: `float numeric`  
+**Takes**: `numeric`  
+**Returns**: `float`
+
+**Description**:
+値をfloatに変換する。
+
+**Examples**:
+```lisp
+(float 1)                                     ; => 1
+(/ (float 3) 2)                               ; => 1.5
 ```
 
 #### ==
@@ -775,8 +830,8 @@ cdr部にdelayオブジェクトの入ったセルを返す。
 
 **Examples**:
 ```lisp
-(< 1 2 3)                                     ; => success
-(< 1 3 2)                                     ; => failure
+(\< 1 2 3)                                     ; => success
+(\< 1 3 2)                                     ; => failure
 ```
 
 #### <=
@@ -791,8 +846,8 @@ cdr部にdelayオブジェクトの入ったセルを返す。
 
 **Examples**:
 ```lisp
-(<= 1 2 2)                                    ; => success
-(<= 2 1)                                      ; => failure
+(\<= 1 2 2)                                    ; => success
+(\<= 2 1)                                      ; => failure
 ```
 
 #### >
@@ -807,8 +862,8 @@ cdr部にdelayオブジェクトの入ったセルを返す。
 
 **Examples**:
 ```lisp
-(> 3 2 1)                                     ; => success
-(> 1 2)                                       ; => failure
+(\> 3 2 1)                                     ; => success
+(\> 1 2)                                       ; => failure
 ```
 
 #### >=
@@ -823,8 +878,8 @@ cdr部にdelayオブジェクトの入ったセルを返す。
 
 **Examples**:
 ```lisp
-(>= 3 2 2)                                    ; => success
-(>= 1 2)                                      ; => failure
+(\>= 3 2 2)                                    ; => success
+(\>= 1 2)                                      ; => failure
 ```
 
 #### not
@@ -838,7 +893,7 @@ cdr部にdelayオブジェクトの入ったセルを返す。
 
 **Examples**:
 ```lisp
-(not (> 1 2))                                 ; => success
+(not (\> 1 2))                                 ; => success
 (not (= a a))                                 ; => failure
 ```
 

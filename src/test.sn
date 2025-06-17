@@ -1,0 +1,834 @@
+(load ./prelude.sn)
+
+; set
+; 基本: 変数に値を設定
+(assert t 1 (do (set $a 1) (== $a 1)))
+(assert t 1 (do (set $a 1) (set $a 2))) ; 更新前の値を返す
+
+; getter形式: head $a の参照を更新
+(assert t 3 (do (set $a (cons 1 2)) (set (head $a) 3) (== (head $a) 3)))
+
+; 変数にリストを代入
+(assert t `(1 & 2) (do (set $a (cons 1 2)) $a))
+
+; setterで新しいシンボルに代入して別参照確認
+(assert t `(1 & 2) (do (set $a (cons 1 2)) (set $b $a) (is $b $a)))
+
+; 引数1個 （placeのみ）
+(assert argument-error () (set $a))
+
+; 引数0個 → 失敗
+(assert argument-error () (set))
+
+; 引数3個
+(set $a ())
+(assert t () (set $a 1 2))
+
+; 数値をplaceに指定 → 失敗
+(assert type-error () (set 1 2))
+
+; リストをplaceに指定 → 失敗
+(assert systemcall-error () (set (1 2 3) 10))
+
+; 文字列をplaceに指定 → 失敗
+(assert type-error () (set 'abc' 1))
+
+; symbolをplaceに指定（評価されるべきではない）→ 失敗
+(assert type-error () (set abc 1))
+
+; 第二引数が評価時に例外 → ゼロ除算
+(assert zero-division-error () (set $a (/ 1 0)))
+
+; listのheadに値をセット（getter）
+(assert t 3 (do
+  (set $a (cons 1 2))
+  (set (head $a) 3)
+  (head $a)))
+
+; getterによるgetterのテスト（入れ子）
+(assert t 9 (do
+  (set $a (cons (cons 1 2) 3))
+  (set (head (head $a)) 9)
+  (head (head $a))))
+
+; 戻り値は更新前の値
+(assert t 5 (do
+  (set $a 5)
+  (set $a 6)))
+
+; set後に確認
+(assert t 6 (do
+  (set $a 5)
+  (set $a 6)
+  $a))
+
+; newvalueの評価が fail で失敗 → set全体も失敗ステータス
+(set $a ())
+(assert f () (set $a (fail)))
+
+; newvalueが if などで失敗になる構造 → set全体も失敗
+(assert f () (set $a (if (= 1 2) 10))) ; 条件が偽 → else節なし → 失敗
+
+; newvalueに head () → 失敗 → set全体が失敗
+(set $a ())
+(assert f () (set $a (head ())))
+
+
+; dynamic
+; ラムダを生成し、その後実行
+(assert t 3
+  (do
+    (set $f (dynamic (x y) (+ $x $y)))
+    ($f 1 2)))  ; => 3
+
+; 引数が足りない場合も () が自動束縛される
+(assert t () 
+  (do
+    (set $f (dynamic (x y) $x))
+    ($f)))
+
+; ネストされた dynamic のラムダを返して実行
+(assert type-error () 
+  (do
+    (set $f (dynamic (x)
+               (dynamic (y)
+                 (+ $x $y))))
+    (set $g ($f 2))
+    ($g 4))) ; => 6
+
+; 外部スコープの $x に影響されない（dynamic は環境を持たない）
+(assert t 20
+  (do
+    (set $x 10)
+    (set $f (dynamic (x) (\* $x 2)))
+    ($f 10)))  ; => 20
+
+; 多値引数の使用
+(assert t 6 
+  (do
+    (set $f (dynamic (a b c) (+ $a (+ $b $c))))
+    ($f 1 2 3))) ; => 6
+
+;; dynamic 引数・型異常系
+
+; 引数がリストでない
+(assert type-error () 
+  (dynamic x (+ $x $x)))
+
+; 引数にsymbol以外 → type-error
+(assert type-error () 
+  (dynamic (`x) (+ $x 1)))
+
+; bodyがない
+(assert t `(dynamic (x)) 
+  (dynamic (x)))
+
+
+;; dynamic 本体中の例外確認（ラムダ評価時）
+
+(assert zero-division-error () 
+  (do
+    (set $f (dynamic (x) (/ 1 0)))
+    ($f 5))) ; ラムダ評価時に0除算
+
+; return により外側の関数から脱出
+(assert t 100
+  ((fn ()
+     (do
+       (set $f (dynamic (x) (return 100)))
+       ($f 999)
+       200))))  ; => 100
+
+
+;; 束縛・リストア確認
+
+; dynamic内での束縛は関数内限定
+(assert t 1
+  (do
+    (set $x 1)
+    (set $f (dynamic (x) (set $x 2)))
+    ($f)
+    $x)) ; => 1
+
+; 上書きして値を返す
+(assert t 42
+  (do
+    (set $x 100)
+    (set $f (dynamic (x) (set $x 42) $x))
+    ($f))) ; => 42
+
+
+;; ラムダ展開と互換確認
+
+(assert t 5
+  (do
+    (set $f (fn (x y) 
+              (set $g (dynamic (y) (+ $x $y)))
+              ($g 3)))
+    ($f 2 99))) ; => 5
+
+;; fn 正常系 - ラムダ式（cell）を生成して実行
+
+; 加算関数
+(assert t 6
+  (do
+    (set $f (fn (x y) (+ $x $y)))
+    ($f 3 3)))  ; => 6
+
+; 引数が足りない場合、() が束縛される
+(assert t () 
+  (do
+    (set $f (fn (x y) (show $x $y)))
+    ($f))) ; => show () ()
+
+; ネストされた fn を使用
+(assert t 9
+  (do
+    (set $adder (fn (x) 
+                  (fn (y) 
+                    (+ $x $y))))
+    (set $add3 ($adder 3))
+    ($add3 6))) ; => 9
+
+; 外部スコープの $x をキャプチャする（環境付き）
+(assert t 20
+  (do
+    (set $x 10)
+    (set $f (fn () (\* $x 2)))
+    ($f))) ; => 20
+
+
+;; fn 異常系
+
+; 引数がリストでない → type-error
+(assert type-error ()
+  (fn x (+ $x 1)))
+
+; 引数にsymbol以外 → type-error
+(assert type-error ()
+  (fn (`x) (+ $x 1)))
+
+; bodyが存在しない
+(assert t `(() (x))
+  (fn (x)))
+
+
+;; fn 内の評価時例外
+
+(assert zero-division-error ()
+  (do
+    (set $f (fn (x) (/ 1 0)))
+    ($f 5))) ; 実行時に 0 除算
+
+(assert t 3
+  (+ 
+    @((fn ()
+      (set $x (cons a 2))
+      (return (cons 1 (rest $x) ()))
+      a)))) ; 展開されて多値
+
+;; return による脱出
+
+(assert t 100
+  ((fn ()
+     (do
+       (set $f (fn (x) (return 42)))
+       ($f 999)
+       100))))  ; => 42
+
+
+;; 束縛確認
+
+; fn内で定義した変数の外部影響なし
+(assert t 5
+  (do
+    (set $x 5)
+    (set $f (fn (x) (set $x 999)))
+    ($f 0)
+    $x)) ; => 5
+
+; 外部変数をキャプチャして使う（環境あり）
+(assert t 12
+  (do
+    (set $a 7)
+    (set $f (fn (x) (+ $a $x)))
+    ($f 5))) ; => 12
+
+
+;; 高階関数の確認
+
+; 関数を返す関数（fnがfnを返す）
+(assert t 15
+  (do
+    (set $make-adder (fn (a)
+                       (fn (b) (+ $a $b))))
+    (set $add10 ($make-adder 10))
+    ($add10 5))) ; => 15
+
+; 単一の式だけ（単なる透過）
+(assert t 1
+  (do 1))
+
+; 複数式を順に評価、最後の戻り値を返す
+(assert t 3
+  (do 1 2 3))
+
+; 関数の定義と呼び出し
+(assert t 5
+  (do
+    (set $f (fn (x) (+ $x 2)))
+    ($f 3)))
+
+; 前の式の戻り値が \$? に格納されている
+(assert t 2
+  (do
+    1
+    2
+    $?))
+
+; 多値評価の途中式でも \$? は一つの戻り値
+(assert t `(3 & 4)
+  (do
+    (set $x (cons 1 2))
+    (set $y (cons 3 4))
+    @(set $y (head $x))
+    $?))
+
+; 最後の式が例外を返す
+(assert zero-division-error ()
+  (do 1 2 (/ 1 0)))
+
+; 中間式でfailしても、do全体は失敗しない（最終式次第）
+(assert t 3
+  (do (fail) 3))
+
+; 最後の式がfail → do 全体が fail
+(assert f ()
+  (do 1 2 (fail)))
+
+; 引数ゼロ → () を返す（何も評価しない）
+(assert t () (do))
+
+; do 内の途中に 未定義関数呼び出し
+(assert systemcall-error ()
+  (do 1 (foobar) 2))
+
+; クォート: 評価せずリストそのもの
+(assert t `(+ 1 2) 
+  (do `(+ 1 2))) ; クォート付き → (+ 1 2) というリストが返る
+
+; クワシクォート（^）+ アンクォート（~）で評価展開
+(assert t `(+ 1 2)
+  (do ^(~+ 1 2))) ; => (+ 1 2)
+
+; 実行と比較
+(assert t 3
+  (do (set $x 1) (set $y 2) (+ $x $y)))
+
+(assert t ()
+  (do
+    (set $x (cons a (cons b (cons c ()))))
+    (echo @$x))) ; 展開されて多値
+
+(assert t 2
+  (do
+    (fail)
+    (if 1 2))) ; failは途中なので do 成功
+
+(assert t 3
+  (+ 
+    @(do
+      (set $x (cons a 2))
+      (cons 1 (rest $x) ())))) ; 展開されて多値
+
+; 単純な条件分岐
+(assert t yes
+  (if (\> 3 2) yes no))
+
+; 最初のcondが失敗 → 次のcondで成功
+(assert t greater
+  (if (\< 3 2) less (\> 3 2) greater equal))
+
+; すべてのcondが失敗 → else評価
+(assert t fallback
+  (if (= 1 2) a (\> 2 3) b fallback))
+
+; else節省略：失敗になるが最後のcondの評価結果が返る
+(assert f 2
+  (if (= 1 2) a))
+
+; 条件部の値は $? に束縛される
+(assert t 6
+  (do
+    (if (= 3 3) 6 7)
+    $?)) ; => $? = (= 3 3) の評価結果 → 6
+
+; then節の副作用
+(assert t 20
+  (do
+    (set $x 10)
+    (if (= $x 10) (set $x 20))
+    $x)) ; => 20
+
+; 条件が success でも thenが fail の場合 → if全体失敗
+(assert f ()
+  (if (= 1 1) (fail) 42))
+
+; 多段条件の最後で成功
+(assert t z
+  (if (= 1 2) x (= 2 3) y (= 3 3) z))
+
+; condが評価時に例外 → 全体が例外になる
+(assert zero-division-error ()
+  (if (/ 1 0) ok no))
+
+; then節で例外 → その時点で例外終了
+(assert zero-division-error ()
+  (if (= 1 1) (/ 1 0) ok))
+
+; else節で例外 → condすべて失敗後に実行される
+(assert zero-division-error ()
+  (if (= 1 2) a (/ 1 0)))
+
+; クォートされた条件節 → 評価されない → type-error などにはならない
+(assert t ok
+  (if `true ok)) 
+
+; クワシクォートによる構文展開
+(assert t ng
+  (if ^(= 1 1) ok ng)) ; => (= 1 1) → 成功
+
+; doを用いたcond/thenの構成
+(assert t done
+  (if (do (echo checking) (= 2 2))
+      (do (echo matched) done)
+      failed))
+
+; 関数と組み合わせた動的条件評価
+(assert t pass
+  (do
+    (set $f (fn () (\> 10 5)))
+    (if ($f) pass fail)))
+
+; 条件部の評価結果は $? に格納
+(assert t 123
+  (do
+    (if (= 1 1) 123)
+    $?)) ; $? ← (= 1 1)
+
+;; 正常系：基本ループとbreak/continueの仕様確認
+
+; 0〜2をechoし、終了。戻り値は ()
+(assert t ()
+  (do
+    (set $i 0)
+    (while (\< $i 3)
+      (echo $i)
+      (set $i (+ $i 1)))))
+
+; break に引数あり → その値をリストで返す
+(assert t `(done)
+  (do
+    (set $i 0)
+    (while (\< $i 3)
+      (echo $i)
+      (break done))))
+
+; continue に引数あり → すべて収集
+(assert t `(0 1 2)
+  (do
+    (set $i 0)
+    (while (\< $i 3)
+      (continue (set $i (+ $i 1))))))
+
+; continue前にインクリメント
+(assert t `(0 1 2)
+  (do
+    (set $i 0)
+    (while (\< $i 3)
+      (set $j $i)
+      (set $i (+ $i 1))
+      (continue $j))))
+
+; break + continue → 両方の戻り値が混ざってリストになる
+(assert t `(x y)
+  (do
+    (set $i 0)
+    (while (\< $i 3)
+      (set $v (if (= $i 0) x (= $i 1) y z))
+      (set $i (+ $i 1))
+      (if (== (% $i 2) 1)
+          (continue $v)
+          (break $v)))))
+
+; condが即座にfalse → body未評価 → 戻り値 ()
+(assert t ()
+  (do
+    (set $i 5)
+    (while (\< $i 3)
+      (echo never))))
+
+; bodyの最後がfail → while全体もfailになる
+(assert f ()
+  (do
+    (set $i 0)
+    (while (\< $i 1)
+      (set $i (+ $i 1))
+      (fail))))
+
+; bodyの最後がsuccess → while全体成功
+(assert t ()
+  (do
+    (set $i 0)
+    (while (\< $i 1)
+      (set $i (+ $i 1))
+      (echo ok))))
+
+; loop内での複数コマンド確認（$i, $sumを更新）
+(assert t ()
+  (do
+    (set $i 0)
+    (set $sum 0)
+    (while (\< $i 3)
+      (set $sum (+ $sum $i))
+      (set $i (+ $i 1)))))
+
+; 最後のbody式がfail → while全体がfail
+(assert f ()
+  (do
+    (set $i 0)
+    (while (\< $i 2)
+      (set $i (+ $i 1))
+      (if (= $i 2) (fail)))))
+
+
+;; 基本動作: while を途中で終了させる
+
+; break によってループを脱出
+(assert t `(done)
+  (do
+    (set $i 0)
+    (while (\< $i 5)
+      (set $i (+ $i 1))
+      (if (= $i 3) (break done)))))
+
+; break に値なし → 戻り値は ()
+(assert t ()
+  (do
+    (set $i 0)
+    (while (\< $i 3)
+      (set $i (+ $i 1))
+      (break))))
+
+; break を複数回 → それぞれの値がリストに蓄積される
+(assert t `(a b c)
+  (do
+    (set $i 0)
+    (while (\< $i 3)
+      (set $i (+ $i 1))
+      (continue (if (= $i 1) a (= $i 2) b c)))))
+
+; break の中で fail する → fail になる（bodyの最後が fail）
+(assert f ()
+  (do
+    (while 1
+      (break @(fail)))))
+
+; break に複雑な式を渡す
+(assert t `(8)
+  (do
+    (set $x 4)
+    (while 1
+      (break (\* $x 2)))))  ; => (* 4 2) = 8, but $x=4 -> (* 4 2)=8
+
+;; continue によってループの残り処理をスキップ
+
+; continue に値あり → 値がリストで返される
+(assert t `(1 2 3)
+  (do
+    (set $i 0)
+    (while (\< $i 3)
+      (set $i (+ $i 1))
+      (continue $i)
+      (set $i (+ $i 1)))))  ; continue後の set は実行されない
+
+; continue に値なし → スキップするが値は返らない
+(assert t ()
+  (do
+    (set $i 0)
+    (while (\< $i 3)
+      (set $i (+ $i 1))
+      (continue))))
+
+; continue + increment の順序を制御して動作確認
+(assert t `(a b c)
+  (do
+    (set $i 0)
+    (while (\< $i 3)
+      (set $x (if (= $i 0) a (= $i 1) b c))
+      (set $i (+ $i 1))
+      (continue $x))))
+
+; continue に複雑な式
+(assert t `(1 2)
+  (do
+    (set $i 1)
+    (while (\< $i 4)
+      (continue (set $i (\* $i 2)))
+      (set $i (+ $i 1)))))
+
+; continue の中で fail 
+(assert t `(())
+  (do
+    (set $i 0)
+    (while (\< $i 1)
+      (set $i (+ $i 1))
+      (continue (fail))
+      (echo ok))))
+
+; break と continue を交互に使い、複数の値が返る
+(assert t `(skip stop)
+  (do
+    (set $i 0)
+    (while (\< $i 4)
+      (set $i (+ $i 1))
+      (if (== (% $i 2) 1)
+          (continue skip)
+          (break stop)))))
+
+;; --- 正常系（展開される形式） ---
+
+; 線形リストを展開
+(assert t `(1 2)
+  @(cons 1 (cons 2 ())))
+
+; 空リストを展開 → 値なし
+(assert t ()
+  @())
+
+; 数値を展開 → 単一値のまま
+(assert t 42
+  @42)
+
+; 文字列を展開 → 単一値のまま
+(assert t 'abc'
+  @'abc')
+
+; symbol を展開 → 単一値のまま
+(assert t hello
+  @hello)
+
+; @$var の形式でリストを展開
+(assert t `(a b)
+  (do
+    (set $x (cons a (cons b ())))
+    @$x))
+
+; @(<式>) の形式
+(assert t `(1 2)
+  @(do (cons 1 (cons 2 ()))))
+
+; 展開した値を関数引数に渡す
+(assert t 3
+  (+ @(cons 1 (cons 2 ()))))
+
+; echo に渡して出力
+(assert t ()
+  (echo @(cons A (cons B ())))) ; 出力: A B\n
+
+; 特殊記号を含むシンボルを含むリスト
+(assert t `(\< \> \*)
+  @(cons \< (cons \> (cons \* ()))))
+
+; (@ ...) 形式 → エラー
+(assert type-error ()
+  (@ (cons 1 2)))
+
+; 単独 @ 
+(assert t @
+  (do @))
+
+;; 正常系：spawn で非同期実行、PIDを取得
+
+(assert t () 
+  (do
+    (set $pid (spawn (echo hello)))
+    (and (is-number $pid) ())))  ; PIDは数値
+
+(assert t () 
+  (do
+    (set $pid (spawn (sleep 1)))
+    (and (is-number $pid) ())))  ; PIDは数値
+
+(assert t () 
+  (do
+    (set $a (spawn (echo a)))
+    (set $b (spawn (echo b)))
+    (and (not (== $a $b)) ()))) ; 異なるPIDを返す
+
+
+;; wait-pidとの組合せ：spawn後に待機できる
+
+(assert t 0
+  (do
+    (set $pid (spawn (echo bg)))
+    (wait-pid $pid)))
+
+
+;; クワシクォートによる動的コマンドのspawn
+
+(assert t ()
+  (do
+    (set $cmd ^(echo ~'dynamic'))
+    (and (is-number (spawn (eval $cmd))) ()))) ; echo dynamic
+
+
+;; 長いsleepとwait-pidでの確認
+
+(assert t 0
+  (do
+    (set $p1 (spawn (sleep 1)))
+    (set $p2 (spawn (sleep 2)))
+    (wait-pid $p1)
+    (wait-pid $p2)))
+
+
+;; 異常系：構文エラーや不正な引数形式
+
+; spawn の引数が無い
+(assert argument-error () (spawn))
+
+; 引数がリストでない
+(assert t () (and (spawn echo) ()))
+
+; 不正な引数リスト（構文エラー含む）
+(assert f 1
+  (do
+    (spawn (echo (1)))
+    (wait-pid $?)))
+
+
+;; -------- return --------
+
+; return によって関数から即時脱出
+(assert t 42
+  ((fn ()
+     (do
+       (return 42)
+       999)))) ; 999は評価されない
+
+; return の直後はスキップされる
+(assert t done
+  ((fn ()
+     (do
+       (set $x 1)
+       (return done)
+       (set $x 999)
+       $x)))) ; $x = 1, return後に999は評価されない
+
+; dynamic 内からの return
+(assert t "escaped"
+  ((fn ()
+     (do
+       ((dynamic (x)
+         (return "escaped")))
+       "after")))) ; "after" は実行されない
+
+; return outside of fn/dynamic → context-error
+(assert context-error ()
+  (return 123))
+
+; 引数なし → return は () を返す（仕様に依るが多くのLisp系では許容）
+(assert t () 
+  ((fn () (return))))
+
+; 引数1個 → OK
+(assert t 123
+  ((fn () (return 123))))
+
+; 引数2個以上
+(assert t 1
+  ((fn () (return 1 2))))
+
+;; --------------------
+;; ✅ raise の正常系
+;; --------------------
+
+; raise で例外発生 → catch 的に handle で捕捉
+(assert t 'caught'
+  (handle
+    (raise custom-error 'some detail')
+    (fn (e msg) 'caught')))
+
+; raise の型・値を handle のハンドラで受け取って利用
+(assert t 'some detail'
+  (handle
+    (raise error 'some detail')
+    (fn (e msg) $msg))) ; msg ← raise の第2引数
+
+; raise の第一引数（型）をハンドラが識別可能
+(assert t 'error'
+  (handle
+    (raise error 'xyz')
+    (fn (e msg) $e))) ; e ← raise の第1引数
+
+; raise による中断 → tryの後続は実行されない
+(assert t ok
+  (handle
+    (do
+      (raise error 'fail')
+      (fail)) ; 実行されない
+    (fn (e msg) 'ok')))
+
+;; --------------------
+;; ❌ raise の引数数不正
+;; --------------------
+
+; 引数なし → argument-error
+(assert argument-error ()
+  (raise))
+
+; 引数1個
+(assert error ()
+  (raise error))
+
+; 引数3個
+(assert error ()
+  (raise error msg extra))
+
+;; --------------------
+;; ✅ handle の正常動作
+;; --------------------
+
+; tryが成功 → handlerは実行されず、値をそのまま返す
+(assert t 3
+  (handle (+ 1 2) (fn (e msg) 'fail')))
+
+; raiseされた例外の内容を正しく渡す
+(assert t 'abc'
+  (handle
+    (raise systemcall-error 'abc')
+    (fn (e msg) $msg)))
+
+; handlerの中でさらにraiseして例外を再送出 → 外に伝播
+(assert type-error ()
+  (handle
+    (raise error 'test')
+    (fn (e msg) (raise type-error 'nested'))))
+
+;; --------------------
+;; ❌ handle の引数不正
+;; --------------------
+
+; 引数なし → argument-error
+(assert argument-error ()
+  (handle))
+
+; 引数1個 → argument-error
+(assert argument-error ()
+  (handle (raise error msg)))
+
+; 引数3個 → argument-error
+(assert t msg
+  (handle (raise error msg) (fn (e m) $m) extra))
+
