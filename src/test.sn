@@ -832,3 +832,471 @@
 (assert t msg
   (handle (raise error msg) (fn (e m) $m) extra))
 
+;; ========== shift ==========
+(assert t 2
+  ((fn (x)
+     (do
+       (set $1 2)
+       (shift))) 1 2 3)) ; => 2
+
+(assert t 3
+  ((fn (x)
+     (do
+       (set $1 2)
+       (shift 2))) 1 2 3)) ; => 3
+
+; 範囲外アクセス → 失敗
+(assert f ()
+  ((fn (x) (shift 99)) 1 2))
+
+; 引数が数値以外 → 型エラー
+(assert type-error () (shift 'x'))
+
+; 引数が多すぎる
+(assert f () (shift 1 2))
+
+;; ========== arg ==========
+(assert t 3
+  ((fn (x) (arg 2)) 1 2 3)) ; => 3
+
+(assert t `(3 4)
+  ((fn (x y) (arg)) 1 2 3 4)) ; => (3 4)
+
+; 未引数の参照
+(assert f () ((fn () (arg 1))))
+
+; 型エラー
+(assert type-error () (arg 'x'))
+
+;; ========== argc ==========
+(assert t 2
+  ((fn (x y) (argc)) 1 2 3 4)) ; => 2
+
+(assert t 0
+  ((fn (x y z w) (argc)) 1 2 3 4)) ; => 0
+
+(assert t 0 (argc 1))
+
+;; ========== wait-pid ==========
+(assert t 0
+  (do
+    (set $pid (spawn (echo bg)))
+    (wait-pid $pid))) ; 正常終了
+
+(assert argument-error () (wait-pid)) ; 引数なし
+
+(assert type-error () (wait-pid 'abc')) ; 型エラー
+
+;; ========== gensym ==========
+(assert t () 
+  (do
+    (set $s1 (gensym))
+    (set $s2 (gensym))
+    (and (is-symbol $s1) (is-symbol $s2) (not (is $s1 $s2)) ())))
+
+(assert t () (and (gensym 1) ())) ; 引数過多
+
+;; ========== trap ==========
+;(assert t ()
+;  (trap SIGINT (echo got-signal)))
+;
+;(assert t ()
+;  (trap error (echo error-handler)))
+;
+;(assert argument-error () (trap)) ; 引数なし
+;
+;(assert type-error () (trap 123 (echo))) ; 第1引数型エラー
+;
+;(assert type-error () (trap error 456)) ; 第2引数型エラー
+;
+;; ========== eval ==========
+(assert t 6
+  (eval (quote (+ 1 2 3)))) ; 評価される
+
+(assert t `(+ 1 2)
+  (eval (quote (quote (+ 1 2))))) ; quote 2重
+
+(assert argument-error () (eval)) ; 引数なし
+
+;; ========== macro-expand ==========
+(assert t `(if (\> x 0) (echo x))
+  (macro-expand (quote (and (\> x 0) (echo x)))))
+
+(assert argument-error () (macro-expand)) ; 引数なし
+
+(assert t `(+ 1 2)
+  (macro-expand (quote (+ 1 2)))) ; マクロ展開不要
+
+;; ========== その他補助 ==========
+(assert t ()
+  (do
+    (set $args (cons 1 (cons 2 ())))
+    (echo @$args))) ; => prints "1 2"
+;; ========== delay ==========
+;
+;; 遅延評価を作成し、forceで強制評価
+;(assert t 6
+;  (do
+;    (set $d (delay (+ 1 2 3)))
+;    (force $d)))
+;
+;; 複数回forceしても同じ結果
+;(assert t 6
+;  (do
+;    (set $d (delay (+ 1 2 3)))
+;    (force $d)
+;    (force $d)))
+;
+;; delayの引数なし → エラー
+;(assert argument-error () (delay))
+;
+;; forceの引数なし → エラー
+;(assert argument-error () (force))
+;
+;; forceに非delay値 → 型エラー
+;(assert type-error () (force 'abc'))
+;
+
+;; ========== open ==========
+
+; 存在しないファイルの読み込み → io-error
+(assert systemcall-error ()
+  (open 'no_such_file.txt'))
+
+; openでstdoutに書き込む（テストでは副作用確認不能）
+(assert t ()
+  (let (STDOUT (open tmp.txt c w)) (echo ok)))
+
+; openでstdinから読み込み（ただしこれは副作用依存）
+(assert t ok
+  (let (STDIN (open tmp.txt r))
+    (read-line))) ; ファイルがなければ io-error
+
+; 引数が足りない
+(assert t () (and (is-file (open)) ()))
+
+
+;; ========== @ 展開の追加確認 ==========
+
+; @でリストを展開して関数に渡す
+(assert t 6
+  (do
+    (set $args (cons 1 (cons 2 (cons 3 ()))))
+    (+ @$args)))
+
+; @$x がリストでない → そのまま渡る
+(assert t abc
+  (do
+    (set $x 'abc')
+    @$x))
+
+; @() → 空
+(assert t ()
+  @())
+;; ========== read-line ==========
+
+; 標準入力がないため read-line は io-error
+(assert f ()
+  (let (STDIN ()) (read-line)))
+
+; 引数あり → argument-error
+(assert f ()
+  (let (STDIN ()) (read-line 1)))
+
+;; ========== pipe ==========
+
+(assert t ()
+  (and (is-file (head (pipe))) ()))
+
+(assert t ()
+  (and (is-file (head (rest (pipe)))) ()))
+
+(assert t ok
+  (let@ (STDIN STDOUT) (pipe)
+    (spawn (echo ok))
+    (read-line)))
+
+; 引数
+(assert t () (and (pipe (raise)) ()))
+
+; 引数が非コマンド → type-error
+(assert t () (and (pipe 123) ()))
+
+;; ========== glob ==========
+
+; 存在しないパターン → 空リスト
+(assert missing-values-error () (echo (expand no-match- *)))
+
+; 拡張子一致パターン
+(assert t `(tmp.txt) (expand * .txt))
+
+(assert t () (if * (not (is $? ()))))
+
+(assert t `(main.rs tmp.txt) (expand * `(.rs .txt)))
+
+(assert t `(main.rs main.rs) (expand `(* ?) ain.rs))
+
+;; ========== peekc ==========
+(assert t 65
+  ((dynamic (STDIN) (peekc)) (chars A))) ; => 'A' = 65
+
+(assert f ()
+  ((dynamic (STDIN) (peekc)) (chars ''))) ; 空 → EOF
+
+(assert type-error () (peekc))
+
+;; ========== readb ==========
+(assert t 65
+  ((dynamic (STDIN) (readb)) (buf A)))
+
+(assert f ()
+  ((dynamic (STDIN) (readb)) (buf '')))
+
+;; ========== readc ==========
+(assert t 65
+  ((dynamic (STDIN) (readc)) (chars A)))
+
+(assert f ()
+  ((dynamic (STDIN) (readc)) (chars '')))
+
+;; ========== echo ==========
+(assert t () (echo a b c))
+(assert t () (echo)) ; 空でもOK
+(assert type-error () (echo (buf a))) ; 異常値で確認（仮）
+
+;; ========== print ==========
+(assert t () (print a b))
+(assert t () (print)) ; 空でもOK
+(assert t () (print 123 + 456 = (+ 123 456)))
+
+;; ========== show ==========
+(assert t () (show (cons 1 2)))
+(assert t () (show)) ; 空でもOK
+
+;; ========== buf ==========
+(assert t ()
+  (if (is-buffered (buf 'hello')) ())) ; 文字列から生成
+
+(assert t ()
+  (if (is-buffered (buf 123)) ())) ; 不正型
+
+;; ========== chars ==========
+(assert t ()
+  (if (is-chars (chars 'hello')) ())) ; chars化
+
+(assert t () 
+  (if (is-chars (chars 123)) ())) ; 型エラー
+
+;; ========== fail ==========
+(assert f () (fail))
+(assert f 123 (fail 123)) ; 引数つき成功（失敗ステータス）
+
+;; ========== copy ==========
+(assert t `(1 & 2)
+  (copy (cons 1 2))) ; ディープコピー
+
+(assert t 'abc' (copy 'abc'))
+
+(assert argument-error () (copy)) ; 引数なし
+
+;; ========== env-var ==========
+(assert t ()
+  (if (is-string (env-var 'PATH')) ()))
+
+(assert argument-error ()
+  (env-var 'NO_SUCH_ENV' 'default'))
+
+(assert argument-error () (env-var)) ; 引数なし
+
+(assert f () (env-var 123)) ; 型エラー
+;; ========== quote ==========
+
+; 数値 → そのまま返す
+(assert t 42
+  (quote 42))
+
+; シンボル → 評価されない
+(assert t x
+  (quote x))
+
+; リスト → 評価されない
+(assert t `(+ 1 2)
+  (quote (+ 1 2)))
+
+; 引数が多すぎる
+(assert t x
+  (quote x y))
+
+;; ========== back-quote (^) + unquote (~) ==========
+
+; クワシクォート + アンクォート（単純加算）
+(assert t `(+ 1 2)
+  ^(+ ~1 ~2))
+
+; クワシクォート + @ 展開
+(assert t `(+ 1 2 3)
+  (do
+    (set $xs `(1 2 3))
+    ^(+ ~@$xs)))
+
+; ネストクォート
+(assert t `^(+ ~1 ~2)
+  (quote ^(+ ~1 ~2)))
+
+;; 引数不足
+;(assert t ^ ^)
+
+; ~ の外側に ^ がない → エラーになるかは処理系次第（ここでは型エラー想定）
+;(assert type-error () (~1))
+;; ========== is-list ==========
+
+(assert t `(1 & 2) (is-list (cons 1 2)))
+(assert f 123 (is-list 123))
+(assert argument-error () (is-list))
+(assert argument-error () (is-list 1 2))
+
+;; ========== is-string ==========
+
+(assert t 'abc' (is-string 'abc'))
+(assert f 123 (is-string 123))
+(assert argument-error () (is-string))
+
+;; ========== is-symbol ==========
+
+(assert t x (is-symbol x))
+(assert f 123 (is-symbol 123))
+(assert argument-error () (is-symbol x y))
+
+;; ========== is-variable ==========
+
+(assert t `$x
+  (is-variable `$x))
+
+(assert f 'not-a-var'
+  (is-variable 'not-a-var'))
+
+;; ========== is-number ==========
+
+(assert t 123 (is-number 123))
+(assert f 'abc' (is-number 'abc'))
+(assert argument-error () (is-number 1 2))
+
+;; ========== is-buffered ==========
+
+(assert t ANY (is-buffered (buf 'hi')))
+(assert f ANY (is-buffered 'plain'))
+(assert argument-error () (is-buffered))
+
+;; ========== is-chars ==========
+
+(assert t ANY (is-chars (chars 'xyz')))
+(assert f ANY (is-chars 'abc'))
+(assert argument-error () (is-chars 1 2))
+
+;; ========== is-file ==========
+
+(assert t ANY
+  (do
+    (set $f (open tmp.txt r))
+    (is-file $f)))
+
+(assert f ANY
+  (is-file 'not-a-file'))
+
+(assert argument-error () (is-file))
+;; ========== 算術演算 ==========
+(assert t 6 (+ 1 2 3))
+(assert t 2 (- 5 3))
+(assert t 6 (\* 2 3))
+(assert t 2 (/ 6 3))
+(assert zero-division-error () (/ 1 0))
+(assert t 1 (% 7 3))
+(assert t 0 (+)) ; 引数なし
+(assert t 1 (\*)) ; 引数なし
+(assert t 0 (-)) ; 引数なし
+(assert t 1 (/)) ; 引数なし
+(assert argument-error () (%)) ; 引数なし
+(assert argument-error () (% 1)) ; 引数なし
+(assert t 2 (+ 2)) ; 引数なし
+(assert t 2 (\* 2)) ; 引数なし
+(assert t -2 (- 2)) ; 引数なし
+(assert t 0.5 (/ 2.0)) ; 引数なし
+(assert type-error () (+ 1 'a'))
+
+;; ========== 比較 ==========
+(assert t 1 (= 1 1))
+(assert f 2 (= 1 2))
+(assert type-error () (== 'x' 'x'))
+(assert type-error () (== 'x' 'y'))
+
+(assert t 2 (\< 1 2))
+(assert f 1 (\< 2 1))
+(assert t 2 (\<= 2 2))
+(assert t 2 (\> 3 2))
+(assert f 2 (\>= 1 2))
+(assert type-error () (\< 1 'a'))
+
+;; ========== 論理 ==========
+(assert t () (not (fail)))
+(assert f 1 (not 1))
+;(assert argument-error () (not)) ; 引数なし
+;; ========== in ==========
+(assert t `(2 3) (in 2 `(1 2 3)))
+(assert f () (in 4 `(1 2 3)))
+(assert argument-error () (in))
+(assert f () (in 1 2)) ; 2 is not list
+
+;; ========== ~（正規表現マッチ） ==========
+(assert t 'aaa'
+  (~ 'aaa' 'a+'))
+(assert f 'aaa'
+  (~ 'aaa' 'b+'))
+(assert argument-error () (~))
+;; ========== cons ==========
+(assert t `(1 & 2) (cons 1 2))
+(assert t `(1) (cons 1))
+(assert t `(()) (cons))
+
+;; ========== head ==========
+(assert t 1 (head (cons 1 2)))
+(assert argument-error () (head))
+(assert f () (head 1))
+
+;; ========== rest ==========
+(assert t 2 (rest (cons 1 2)))
+(assert argument-error () (rest))
+(assert f () (rest 1))
+;; ========== dict ==========
+(assert t 'a'
+  (do (set $d (dict 'x' 'a'))
+      ($d 'x')))
+(assert f ()
+  (do (set $d (dict)) ($d 'x')))
+(assert argument-error () (dict 'a')) ; 奇数長
+
+;; ========== del ==========
+(assert f ()
+  (do
+    (set $d (dict 'x' 1))
+    (del $d 'x')
+    ($d 'x')))
+(assert argument-error () (del (dict))) ; 引数不足
+;; ========== parse ==========
+(assert t `(+ 1 2)
+  (let (STDIN (chars '(+ 1 2)'))
+    (parse)))
+
+(assert parse-error ()
+  (let (STDIN (chars '(+ 1 2'))
+    (parse)))
+
+(assert f ()
+  (let (STDIN (chars ')'))
+    (parse)))
+
+;; ========== cur-line ==========
+(assert t 1
+  (let (STDIN (chars '(+ 1 2'))
+    (is-number (cur-line))))
+(assert type-error () (is-number (cur-line))) ; 返り値が行番号
+

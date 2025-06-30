@@ -49,7 +49,7 @@ impl Mode {
         match self {
             Mode::Multi => Mode::DoMulti,
             Mode::Set => Mode::DoSet,
-            _ => Mode::Single
+            _ => self.for_special_form()
         }
     }
     #[inline(always)]
@@ -57,6 +57,7 @@ impl Mode {
         match self {
             Mode::DoMulti => Mode::Multi,
             Mode::DoSet => Mode::Set,
+            Mode::Set => Mode::Set,
             _ => Mode::Single
         }
     }
@@ -307,6 +308,19 @@ impl Val {
         }
     }
     #[inline(always)]
+    fn is_displayable (&self) -> bool {
+        unsafe {
+            match self.id & TAG_MASK {
+                CELL => false,
+                FAT => match self.fat() {
+                    Fat::Buf(_)|Fat::Chars(_)|Fat::Dict(_)|Fat::Nothing  => false,
+                    _ => true,
+                }
+                _ => true,
+            }
+        }
+    }
+    #[inline(always)]
     fn add_tag (self, tag: usize) -> Self {
         unsafe {
             let result = Val {id: self.id | tag};
@@ -521,9 +535,7 @@ impl Val {
         if !self.is_piper() {
             panic!();
         }
-        let mut tmp = Fat::Nothing;
-        std::mem::swap(&mut tmp, &mut self.fat());
-        match tmp {
+        match self.fat() {
             Fat::PipeR(r) => r.try_clone().unwrap(),
             _ => panic!()
         }
@@ -545,9 +557,7 @@ impl Val {
         if !self.is_pipew() {
             panic!();
         }
-        let mut tmp = Fat::Nothing;
-        std::mem::swap(&mut tmp, &mut self.fat());
-        match tmp {
+        match self.fat() {
             Fat::PipeW(w) => w.try_clone().unwrap(),
             _ => panic!()
         }
@@ -678,6 +688,31 @@ impl Val {
             std::mem::forget(tmp);
             (*result.fat).count = 1;
             result.add_tag(FAT)
+        }
+    }
+    fn deep_copy(&self) -> Result<Val, Val> {
+        unsafe {
+            match self.id & TAG_MASK {
+                CELL => Ok(cons(self.car().deep_copy()?, self.cdr().deep_copy()?)),
+                FAT => {
+                    let contents = match self.fat() {
+                            Fat::Captured(x) => Fat::Captured(x.deep_copy()?),
+                            Fat::Float(x) => Fat::Float(*x),
+                            Fat::File(x) => Fat::File(Box::new(x.try_clone().unwrap())),
+                            Fat::PipeR(x) => Fat::PipeR(Box::new(x.try_clone().unwrap())),
+                            Fat::PipeW(x) => Fat::PipeW(Box::new(x.try_clone().unwrap())),
+                            Fat::Dict(x) => Fat::Dict(x.clone()),
+                            Fat::Nothing => Fat::Nothing,
+                            _ => return Err(self.clone())
+                    };
+
+                    let result = Val::new();
+                    let tmp = std::mem::replace(&mut (*result.fat).val, contents);
+                    std::mem::forget(tmp);
+                    Ok(result)
+                }
+                _ => Ok(self.clone()),
+            }
         }
     }
 }
@@ -1048,6 +1083,7 @@ impl std::io::Write for Val {
         if self.is_file() {
             self.file().write(buf)
         } else if self.is_pipew() {
+            println!("a");
             self.pipew().write(buf)
         } else {
             Ok(0)
@@ -1186,7 +1222,6 @@ struct Symbols {
     fn_: Val,
     dynamic: Val,
     var: Val,
-    read: Val,
     swap: Val,
     arg: Val,
     argc: Val,
@@ -1210,12 +1245,14 @@ struct Symbols {
     encode_err: Val,
     parse_err: Val,
     zero_division_err: Val,
+    missing_values_err: Val,
     multi_done: Val,
     swap_done: Val,
     progn: Val,
     mac: Val,
     unquote: Val,
     app_arg: Val,
+    empty_str: Val,
 }
 impl Env {
     fn new(pool_size: usize, stack_size: usize) -> Env {
@@ -1241,6 +1278,7 @@ impl Env {
         let _ = "macro-expand".intern_func(macro_expand);
         let _ = "eval".intern_func(eval);
         let _ = "fail".intern_func(fail);
+        let _ = "copy".intern_func(deep_copy);
 
         let _ = "+".intern_func(calc_fn1::<AddOp>);
         let _ = "-".intern_func(calc_fn1::<SubOp>);
@@ -1281,6 +1319,7 @@ impl Env {
 
         let _ = "read-line".intern_func(read_line);
         let _ = "readc".intern_func(read_char);
+        let _ = "readb".intern_func(readb);
         let _ = "peekc".intern_func(peek);
         let _ = "cur-line".intern_func(cur_line);
         let _ = "parse".intern_func(parse);
@@ -1293,6 +1332,7 @@ impl Env {
         let _ = "chars".intern_func(chars);
         let _ = "open".intern_func(open);
         let _ = "env-var".intern_func(getenv);
+        let glob = "glob".to_sym(nil.clone(), Val{func: glob_at}.add_tag(FUNC));
 
         let std_in :Val = std::io::stdin().as_raw_fd().into();
         let std_out:Val = std::io::stdout().as_raw_fd().into();
@@ -1316,12 +1356,11 @@ impl Env {
             mval: mval.clone(),
 
             cons: "cons".intern_func(cons_),
-            read:"read".intern_func(read_line),
             arg: "arg".intern_func(arg),
             argc: "argc".intern_func(argc),
             quote: "quote".intern_func(quote),
             back_quote: "back_quote".intern_func(back_quote),
-            glob:"glob".intern_func(glob_),
+            glob,
             stdin: "STDIN".intern_and_set(std_in, nil.clone()).remove_tag(SYM),
             stdout:"STDOUT".intern_and_set(std_out, nil.clone()).remove_tag(SYM),
             stderr:"STDERR".intern_and_set(std_err, nil.clone()).remove_tag(SYM),
@@ -1334,6 +1373,7 @@ impl Env {
             regex_err:"regex-error".intern(),
             context_err:"context-error".intern(),
             glob_err:"glob-error".intern(),
+            missing_values_err:"missing-values-error".intern(),
             encode_err:"encode-error".intern(),
             parse_err:"parse-error".intern(),
             zero_division_err:"zero-division-error".intern(),
@@ -1341,6 +1381,7 @@ impl Env {
             swap_done: "swap_done".to_sym(nil.clone(), nil.clone()),
             unquote: "unquote".to_sym(nil.clone(), nil.clone()),
             app_arg: cons(cons(mval, cons(cons("arg".intern(), nil.clone()), nil.clone())), nil.clone()),
+            empty_str: "".intern(),
         };
 
         Self {
@@ -2186,14 +2227,14 @@ impl<'a, R: std::io::Read> CharsAPI for PeekableReader<'a, R> {
                 let _ = self.next();
                 match self.parse(env)? {
                     Some(val) => Ok(Some(cons(env.sym.back_quote.clone(), cons(val, env.nil())))),
-                    _ => return self.syntax_err()
+                    _ => Ok(Some("^".intern()))
                 }
             }
             '~' => {
                 let _ = self.next();
                 match self.parse(env)? {
                     Some(val) => Ok(Some(cons(env.sym.unquote.clone(), cons(val, env.nil())))),
-                    _ => return self.syntax_err()
+                    _ => Ok(Some("~".intern()))
                 }
             }
             '?'|'*' => {
@@ -2594,8 +2635,13 @@ fn shift(env: &mut Env, mode: Mode, ast: &Val) -> Result<bool, Exception> {
         result = env.rest_stack.pop().unwrap();
     }
     env.rest_stack.push(std::cmp::max(rest_len - n, 0).into());
-    env.arg_stack.push(result);
-    Ok(n <= rest_len)
+    if n <= rest_len {
+        env.arg_stack.push(result);
+        Ok(true)
+    } else {
+        env.arg_stack.push(env.nil());
+        Ok(false)
+    }
 }
 fn arg(env: &mut Env, mode: Mode, ast: &Val) -> Result<bool, Exception> {
     let old_stack_len = env.eval_args(ast)?;
@@ -2622,7 +2668,7 @@ fn arg(env: &mut Env, mode: Mode, ast: &Val) -> Result<bool, Exception> {
             return Ok(false);
         }
 
-        let l = env.rest_stack.len();
+        let l = env.rest_stack.len() - 2;
         if mode == Mode::Set {
             let new = std::mem::replace(&mut env.set_val, env.sym.swap_done.clone());
             let old = std::mem::replace(&mut env.rest_stack[l - (n as usize)], new);
@@ -2737,6 +2783,17 @@ fn gensym(env: &mut Env, mode: Mode, ast: &Val) -> Result<bool, Exception> {
 }
 
 fn trap(env: &mut Env, mode: Mode, ast: &Val) -> Result<bool, Exception> {
+    Ok(true)
+}
+
+fn deep_copy(env: &mut Env, mode: Mode, ast: &Val) -> Result<bool, Exception> {
+    let old_stack_len = env.eval_args(ast)?;
+    if env.arg_stack.len() - old_stack_len != 1 {
+        return Err(env.argument_err("copy", env.arg_stack.len() - old_stack_len, "1"));
+    }
+    let v = env.arg_stack.pop().unwrap();
+    let copied = v.deep_copy().or_else(|v|Err(env.type_err("copy", &v, "copyable type")))?;
+    env.push(copied);
     Ok(true)
 }
 
@@ -2859,7 +2916,7 @@ where
             }
             Err(v) => {
                 match f64::try_from(v) {
-                    Ok(f) if old_stack_len + 1 == env.arg_stack.len() => {
+                    Ok(f) if old_stack_len == env.arg_stack.len() => {
                         env.push(Op::unit(f).into());
                     }
                     Ok(f) => {
@@ -3088,44 +3145,30 @@ fn is(env: &mut Env, mode: Mode, ast: &Val) -> Result<bool, Exception> {
     Ok(result)
 }
 fn in_(env: &mut Env, mode: Mode, ast: &Val) -> Result<bool, Exception> {
-    let old_stack_len = env.arg_stack.len();
-    let mut ast = ast;
-    let mut cond = true;
-    while ast.is_cell() {
-        cond &= env.eval(Mode::None, ast.car())?;
-        ast = ast.cdr();
-    }
-    if !cond {
-        env.leave_last_arg_or_nil(old_stack_len);
-        return Ok(false);
+    let old_stack_len = env.eval_args(ast)?;
+
+    if old_stack_len + 1 > env.arg_stack.len() {
+        return Err(env.argument_err("in", env.arg_stack.len() - old_stack_len, "1 or more"));
     }
 
-    if old_stack_len + 2 > env.arg_stack.len() {
-        env.leave_last_arg_or_nil(old_stack_len);
-        return Ok(true);
-    }
-
+    env.arg_stack[old_stack_len..].reverse();
     let v = env.arg_stack.pop().unwrap();
-    let mut result = true;
-    for _ in old_stack_len..env.arg_stack.len() - 1 {
-        let u = env.arg_stack.pop().unwrap();
-        if u.is_cell() {
-            for u in &u {
-                if &v != u {
-                    result = false;
-                    break;
-                }
-            }
-        } else {
-            if v != u {
-                result = false;
+    let mut result = false;
+    let mut rest = env.nil();
+    for _ in old_stack_len..env.arg_stack.len() {
+        let tmp = env.arg_stack.pop().unwrap();
+        let mut xs = &tmp;
+        while xs.is_cell() {
+            if &v == xs.car() {
+                result = true;
+                rest = xs.clone();
                 break;
             }
+            xs = xs.cdr();
         }
     }
-
     env.arg_stack.truncate(old_stack_len);
-    env.push(v);
+    env.push(rest);
     Ok(result)
 }
 fn mod_(env: &mut Env, mode: Mode, ast: &Val) -> Result<bool, Exception> {
@@ -3278,7 +3321,7 @@ fn is_file(env: &mut Env, mode: Mode, ast: &Val) -> Result<bool, Exception> {
     if old_stack_len + 1 != env.arg_stack.len() {
         return Err(env.argument_err("is_file", env.arg_stack.len() - old_stack_len, "1"));
     }
-    Ok(env.arg_stack[old_stack_len].is_file())
+    Ok(env.arg_stack[old_stack_len].is_file() || env.arg_stack[old_stack_len].is_piper() || env.arg_stack[old_stack_len].is_pipew())
 }
 
 fn cons_(env: &mut Env, mode: Mode, ast: &Val) -> Result<bool, Exception> {
@@ -3361,6 +3404,7 @@ fn dict(env: &mut Env, mode: Mode, ast: &Val) -> Result<bool, Exception> {
         let val = env.arg_stack.pop().unwrap();
         result.dict().insert(key.into_owned(), val);
     }
+    env.push(result);
 
     Ok(true)
 }
@@ -3414,6 +3458,66 @@ fn split(env: &mut Env, mode: Mode, ast: &Val) -> Result<bool, Exception> {
     env.stack_to_list(mode, old_stack_len);
     Ok(true)
 }
+
+fn flat_list(env: &Env, result: &mut Vec<Val>, xs: Val) {
+    if xs.is_cell() {
+        if xs.car() == &env.sym.glob {
+            result.push(xs);
+        } else {
+            for i in &xs {
+                flat_list(env, result, i.clone());
+            }
+        }
+    } else {
+        result.push(xs);
+    }
+}
+fn prod(env: &Env, left: Vec<Vec<Val>>, right: Val) -> Vec<Vec<Val>> {
+    let mut xs = Vec::<Val>::new();
+    flat_list(env, &mut xs, right);
+
+    let mut result = Vec::<Vec<Val>>::new();
+    for i in left {
+        for j in &xs {
+            let mut i = i.clone();
+            i.push(j.clone());
+            result.push(i);
+        }
+    }
+    result
+}
+fn glob_expand(env: &mut Env, pattern: &str) -> Result<(), Exception> {
+    let paths = glob(pattern).or_else(|_|Err(env.other_err(env.sym.glob_err.clone(),
+    format!("{}: failed to path name expansion", pattern))))?;
+    for j in paths {
+        let path = j.or_else(|e|Err(env.other_err(env.sym.glob_err.clone(),
+        format!("failed to path name expansion: detail={}", e))))?;
+        env.push(path.to_str());
+    }
+    Ok(())
+}
+fn brace_expand(env: &mut Env, l: usize) -> Vec<Vec<Val>> {
+    let mut result = vec![vec![env.sym.empty_str.clone()]];
+    for _ in 0..l {
+        let v = env.arg_stack.pop().unwrap();
+        result = prod(env, result, v);
+    }
+    result
+}
+/*
+fn glob_expand(env: &mut Env, patterns: Vec<PathBuf>) -> Result<Vec<PathBuf>, Exception> {
+    let mut result = Vec::<PathBuf>::new();
+    for i in patterns {
+        let paths = glob(&(i.to_string_lossy())).or_else(|_|Err(env.other_err(env.sym.glob_err.clone(),
+                    format!("{}: failed to path name expansion", i.display()))))?;
+        for j in paths {
+            let path = j.or_else(|e|Err(env.other_err(env.sym.glob_err.clone(),
+                            format!("failed to path name expansion: detail={}", e))))?;
+            result.push(path);
+        }
+    }
+    Ok(result)
+}
 fn flat_list(env: &mut Env, result: &mut Vec<PathBuf>, xs: &Val, globing: bool) -> Result<(), Exception> {
     if xs.is_cell() {
         if xs.car() == &env.sym.glob {
@@ -3443,20 +3547,9 @@ fn prod(env: &mut Env, left: Vec<PathBuf>, right: Val, globing: bool) -> Result<
     let mut result = Vec::<PathBuf>::new();
     for i in left {
         for j in &ss {
-            result.push(i.join(j));
-        }
-    }
-    Ok(result)
-}
-fn glob_expand(env: &mut Env, patterns: Vec<PathBuf>) -> Result<Vec<PathBuf>, Exception> {
-    let mut result = Vec::<PathBuf>::new();
-    for i in patterns {
-        let paths = glob(&(i.to_string_lossy())).or_else(|_|Err(env.other_err(env.sym.glob_err.clone(),
-                    format!("{}: failed to path name expansion", i.display()))))?;
-        for j in paths {
-            let path = j.or_else(|e|Err(env.other_err(env.sym.glob_err.clone(),
-                            format!("failed to path name expansion: detail={}", e))))?;
-            result.push(path);
+            let mut i = OsString::from(&i);
+            i.push(j.as_os_str());
+            result.push(i.into());
         }
     }
     Ok(result)
@@ -3470,11 +3563,19 @@ fn brace_expand(env: &mut Env, mode: Mode, globing: bool, l: usize) -> Result<bo
     if globing {
         result = glob_expand(env, result)?;
     }
-    if mode == Mode::Multi {
+
+    if mode == Mode::None || mode == Mode::Multi {
+        let mut nothing = true; 
         for i in result {
+            nothing = false;
             env.push(i.to_str());
         }
-        env.push(env.sym.multi_done.clone());
+        if mode == Mode::Multi {
+            env.push(env.sym.multi_done.clone());
+        } else if nothing {
+            return Err(env.other_err(env.sym.missing_values_err.clone(),
+                    format!("missing values to expansion")));
+        }
     } else {
         let mut cdr = nil();
         while let Some(car) = result.pop() {
@@ -3489,7 +3590,7 @@ fn expand(env: &mut Env, mode: Mode, ast: &Val) -> Result<bool, Exception> {
     let mut globing = false;
     for arg in ast {
         if arg.is_cell() && arg.car() == &env.sym.glob {
-            globing == true;
+            globing = true;
             env.push(arg.clone());
         } else {
             let _ = env.eval(Mode::None, arg)?;
@@ -3504,29 +3605,83 @@ fn expand(env: &mut Env, mode: Mode, ast: &Val) -> Result<bool, Exception> {
         }
     }
 
-    let mut s = PathBuf::new();
+    let mut s = OsString::new();
     for _ in 0..arg_n {
         let path = Cow::<Path>::try_from(env.arg_stack.pop().unwrap())
             .or_else(|v|Err(env.type_err_to_str("expand", &v)))?;
-        s.push(path);
+        s.push(path.as_os_str());
     }
 
-    env.push(s.to_str());
+    let path: PathBuf = s.into();
+    env.push(path.to_str());
     Ok(true)
 }
-fn glob_(env: &mut Env, mode: Mode, ast: &Val) -> Result<bool, Exception> {
-    let pattern = ast.to_str().unwrap();
-    let paths = glob(&*pattern).or_else(|_|Err(env.other_err(env.sym.glob_err.clone(),
-                        format!("{}: failed to path name expansion", pattern))))?;
+*/
+fn expand(env: &mut Env, mode: Mode, ast: &Val) -> Result<bool, Exception> {
     let old_stack_len = env.arg_stack.len();
-    for j in paths {
-        let path = j.or_else(|e|Err(env.other_err(env.sym.glob_err.clone(),
-                format!("failed to path name expansion: detail={}", e))))?;
-        env.push(path.to_str());
+    for arg in ast {
+        if arg.is_cell() && arg.car() == &env.sym.glob {
+            env.push(arg.clone());
+        } else {
+            let _ = env.eval(Mode::None, arg)?;
+        }
     }
+    env.arg_stack[old_stack_len..].reverse();
+    let vlists = brace_expand(env, env.arg_stack.len() - old_stack_len);
+    for vlist in vlists {
+        let mut globing = false;
+        for v in &vlist {
+            if v.is_cell() && v.car() == &env.sym.glob {
+                globing = true;
+            }
+        }
+        if globing {
+            let mut s = String::new();
+            for v in vlist {
+                if v.is_cell() && v.car() == &env.sym.glob {
+                    s.push_str(&*v.cdr().to_str().unwrap());
+                } else {
+                    let to_esc = v.to_str()
+                        .or_else(|_|Err(env.type_err_to_str("expand", &v)))?;
+                    s.push_str(&Pattern::escape(&*to_esc));
+                }
+            }
+            glob_expand(env, &s)?;
+        } else {
+            let mut s = OsString::new();
+            for v in vlist {
+                let path = Cow::<Path>::try_from(v)
+                    .or_else(|v|Err(env.type_err_to_str("expand", &v)))?;
+                s.push(path.as_os_str());
+            }
+            env.push(PathBuf::from(s).to_str());
+        }
+    }
+                
+    if mode == Mode::None {
+        if old_stack_len == env.arg_stack.len() {
+            return Err(env.other_err(env.sym.missing_values_err.clone(),
+            format!("missing values to expansion")))
+        } else {
+            Ok(true)
+        }
+    } else {
+        env.stack_to_list(mode, old_stack_len);
+        Ok(true)
+    }
+}
+
+fn glob_at(env: &mut Env, mode: Mode, ast: &Val) -> Result<bool, Exception> {
+    let old_stack_len = env.arg_stack.len();
+    glob_expand(env, &*ast.to_str().unwrap())?;
 
     if mode == Mode::None {
-        Ok(true)
+        if old_stack_len == env.arg_stack.len() {
+            Err(env.other_err(env.sym.missing_values_err.clone(),
+            format!("missing values to expansion")))
+        } else {
+            Ok(true)
+        }
     } else {
         env.stack_to_list(mode, old_stack_len);
         Ok(true)
@@ -3556,10 +3711,15 @@ fn str(env: &mut Env, mode: Mode, ast: &Val) -> Result<bool, Exception> {
 
 fn read_line(env: &mut Env, mode: Mode, ast: &Val) -> Result<bool, Exception> {
     let mut buf = vec![];
-    let _ = env.sym.stdin.var().val.read_until(b'\n', &mut buf)
-        .or_else(|e|Err(env.read_err("read-line", e)));
-    env.push(PathBuf::from(OsString::from_vec(buf)).to_str());
-    Ok(true)
+    let n = env.sym.stdin.var().val.read_until(b'\n', &mut buf)
+        .or_else(|e|Err(env.read_err("read-line", e)))?;
+    if n > 0 {
+        env.push(PathBuf::from(OsString::from_vec(buf)).to_str());
+        Ok(true)
+    } else {
+        env.push(env.nil());
+        Ok(false)
+    }
 }
 fn readb(env: &mut Env, mode: Mode, ast: &Val) -> Result<bool, Exception> {
     let mut buf = [0u8; 1];
@@ -3703,7 +3863,8 @@ fn load(env: &mut Env, mode: Mode, ast: &Val) -> Result<bool, Exception> {
 }
 fn echo(env: &mut Env, mode: Mode, ast: &Val) -> Result<bool, Exception> {
     let _ = print_internal(env, mode, ast, "echo")?;
-    env.sym.stdin.var().val.write(b"\n");
+    env.sym.stdout.var().val.write(b"\n");
+    env.sym.stdout.var().val.flush();
     Ok(true)
 }
 fn print(env: &mut Env, mode: Mode, ast: &Val) -> Result<bool, Exception> {
@@ -3716,19 +3877,25 @@ fn print_internal(env: &mut Env, mode: Mode, ast: &Val, name: &str) -> Result<bo
         let tmp = env.sym.ifs.var().val.clone();
         let ifs = tmp.to_path()
             .or_else(|v|Err(env.type_err_to_str(name, &tmp)))?;
-        let ifs = ifs.as_os_str().as_encoded_bytes();
+        let ifs = ifs.display();
 
         env.arg_stack[old_stack_len..].reverse();
-        let path = Cow::<Path>::try_from(env.arg_stack.pop().unwrap())
-            .or_else(|v|Err(env.type_err_to_str(name, &v)))?;
-        env.sym.stdout.var().val.write(path.as_os_str().as_encoded_bytes());
+        let v = env.arg_stack.pop().unwrap();
+        if v.is_displayable() {
+            write!(env.sym.stdout.var().val, "{}", v);
+        } else {
+            return Err(env.type_err_to_str(name, &v));
+        }
         for _ in 1..arg_n {
-            let path = Cow::<Path>::try_from(env.arg_stack.pop().unwrap())
-                .or_else(|v|Err(env.type_err_to_str(name, &v)))?;
-            env.sym.stdout.var().val.write(ifs);
-            env.sym.stdout.var().val.write(path.as_os_str().as_encoded_bytes());
+            let v = env.arg_stack.pop().unwrap();
+            if v.is_displayable() {
+                write!(env.sym.stdout.var().val, "{}{}", ifs, v);
+            } else {
+                return Err(env.type_err_to_str(name, &v));
+            }
         }
     }
+    env.sym.stdout.var().val.flush();
     env.push(env.nil());
     Ok(true)
 }
@@ -3739,16 +3906,15 @@ fn show(env: &mut Env, mode: Mode, ast: &Val) -> Result<bool, Exception> {
         let tmp = env.sym.ifs.var().val.clone();
         let ifs = tmp.to_path()
             .or_else(|v|Err(env.type_err_to_str("show", &tmp)))?;
-        let ifs = ifs.as_os_str().as_encoded_bytes();
+        let ifs = ifs.display();
 
         env.arg_stack[old_stack_len..].reverse();
         write!(env.sym.stdout.var().val, "{}", env.arg_stack.pop().unwrap());
         for _ in 1..arg_n {
-            env.sym.stdout.var().val.write(ifs);
-            write!(env.sym.stdout.var().val, "{}", env.arg_stack.pop().unwrap());
+            write!(env.sym.stdout.var().val, "{}{}", ifs, env.arg_stack.pop().unwrap());
         }
     }
-    env.sym.stdin.var().val.write(b"\n");
+    env.sym.stdout.var().val.write(b"\n");
     env.push(env.nil());
     Ok(true)
 }
@@ -3807,9 +3973,6 @@ fn chars(env: &mut Env, _: Mode, ast: &Val) -> Result<bool, Exception> {
 }
 fn open(env: &mut Env, _: Mode, ast: &Val) -> Result<bool, Exception> {
     let old_stack_len = env.eval_args(ast)?;
-    if env.arg_stack.len() - old_stack_len > 1 {
-        return Err(env.argument_err("open", env.arg_stack.len() - old_stack_len, "0 or 1"));
-    }
     if old_stack_len == env.arg_stack.len() {
         match tempfile() {
             Ok(f) => {
@@ -3821,10 +3984,25 @@ fn open(env: &mut Env, _: Mode, ast: &Val) -> Result<bool, Exception> {
             }
         }
     } else {
+        let mut options = OpenOptions::new();
+        for _ in old_stack_len + 1 .. env.arg_stack.len() {
+            let v = env.arg_stack.pop().unwrap();
+            let m = v.to_str()
+                .or_else(|_|Err(env.type_err_to_str("open", &v)))?;
+            let _ = match &*m {
+                "r" => options.read(true),
+                "w" => options.write(true),
+                "a" => options.append(true),
+                "c" => options.create(true),
+                _ => &mut options
+            };
+        }
+
         let val = env.arg_stack.pop().unwrap();
         let path = val.to_path()
             .or_else(|_|Err(env.type_err_to_str("open", &val)))?;
-        match OpenOptions::new().read(true).write(true).create(true).open(&path) {
+        println!("aaa: {:?} {:?}", options, path);
+        match options.open(&path) {
             Ok(f) => {
                 env.arg_stack.push(f.into());
             }
@@ -3955,7 +4133,7 @@ fn main() {
                                     }
                                 };
 
-                                //println!("expanded: {}", expanded);
+                                println!("expanded: {}", expanded);
                                 match env.eval(Mode::Single, &expanded) {
                                     Ok(x) => {
                                         //println!("{}", x);

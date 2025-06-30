@@ -354,8 +354,41 @@ while ループの次の繰り返しへ。
 
 **Examples**:
 ```lisp
-(echo @(cons a (cons b ())))              ; => prints a b
+(echo @(cons a (cons b ())))                   ; => prints a b
+(cons (if t @(cons 1 2 ())) ())                ; => ((1 2))
+(cons (if (fail) () @(cons 1 2 ())) ())        ; => ((1 2))
+(cons (do @(cons 1 2 ()) @(cons 1 2 ())) ())   ; => ((1 2))
+(set @$a 1)                                    ; equal (set $a 1)
+(cons @(@(cons 1 2 ())))                       ; => (1 2)
+(cons @(fn () (return (cons 1 2 ())) 1) ())    ; => (1 2)
+(cons @(fn () (return (cons 1 2 ()))) ())      ; => (1 2)
+(cons (fn () @(return (cons 1 2 ())) 1) ())    ; => ((1 2))
+(cons (fn () @(return (cons 1 2 ()))) ())      ; => ((1 2))
+(set $a `(1 2))
+(set (fn () (return (head $a)) 1) 3)           ; $a = (3 2)
+(set @(fn () (return (head $a)) 1) 4)          ; $a = (4 2)
+(cons * ())                                    ; => (main.rs ...)
+(cons (expand `(.)`(glob *)) ())               ; => (. .. ...)
+(cons (expand `(1 2) .txt) ())                 ; => (1.txt 2.txt)
+(cons @(glob \*) ())                           ; => (main.rs ...)
+(if * file-exist)                              ; => file-exist
+(if (expand `(1 2) .txt) pass)                 ; => pass
+(do * file-exist)                              ; => file-exist
+(do (expand `(1 2) .txt) pass)                 ; => pass
 ```
+
+|event  |None   |Single |Multi  |DoMulti|Set    |DoSet  |
+|-------|-------|-------|-------|-------|-------|-------|
+|if     |Single |Single |Multi  |DoMulti|Set    |DoSet  | 特殊形式引数では多値指定は無効
+|progn1 |Single |Single |DoMulti|DoMulti|DoSet  |DoSet  | +progn形式の1~n-1番目では全て単値相当、returnのみ特別
+|progn2 |Single |Single |Multi  |DoMulti|Set    |DoSet  | 特殊形式引数では多値指定は無効
+|set    |Set    |Set    |Set    |Set    |Set    |Set    |　代入は多値に優先 複数のsetのは無効
+|@      |Multi  |Single |Multi  |DoMulti|Set    |DoSet  | 多値の優先度は最低　複数の多値は無効
+|return |Single |Single |Single |Multi  |Set    |Set    | progn形式の1~n-1番目で使用した時だけ多値が返せる
+|引数   |None   |None   |None   |None   |None   |None   | 引数位置では状態をリセット
+|glob   |多値2  |リスト   |多値1  |-      |-      |-      | デフォルトが多値
+|expand1|多値2  |リスト   |多値1  |-      |-      |-      | デフォルトが多値
+|参照   |単値   |単値   |単値 　 |-      |代入   |-      | 多値指定には無反応
 
 #### spawn
 
@@ -1371,8 +1404,9 @@ STDOUTまたは指定されたオブジェクトに値をデバッグ形式で�
 ```lisp
 (pipe)                                       ; => (read-fd write-fd)
 (let (p (pipe))
-  (echo test > (rest p))
-  (read-line (head p)))                      ; => test
+  (let (STDIN (head p) STDOUT (rest p))
+    (echo test)
+    (read-line)))                            ; => test
 ```
 
 #### buf
@@ -1407,8 +1441,8 @@ fileオブジェクトまたは文字列からユニコード文字を一文字�
 
 #### open
 
-**Usage**: `open [filename [mode]]`  
-**Takes**: `[displayable [displayable]]`  
+**Usage**: `open [filename [mode]...]`  
+**Takes**: `[displayable [displayable]...]`  
 **Returns**: `file`
 
 **Description**:

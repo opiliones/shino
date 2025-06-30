@@ -32,6 +32,12 @@
 (def and- (test rest)
   (if (is-atom $rest) $test ^(if ~$test ~(and- (head $rest) (rest $rest)))))
 
+(mac or (test)
+  ^(not ~(or- $test (arg))))
+
+(def or- (test rest)
+  (if (is-atom $rest) ^(not ~$test) ^(if (not ~$test) ~(or- (head $rest) (rest $rest)))))
+
 (def same (xs ys f)
   (if (= $f ()) (set $f =))
   (if (is-atom  $xs) 
@@ -55,10 +61,9 @@
             (show ' ' givien-status = $e expect-status = $expect-status)
             (show ' ' msg = $msg)))
           (raise ret)))
-      (if (and (is $given-status $expect-status) (same $given-ret $expect-ret))
+      (if (and (is $given-status $expect-status) (or (is ANY $expect-ret) (same $given-ret $expect-ret)))
         (show PASS: $test)
         (do (show ERROR: $test)
             (show ' ' givien-status = $given-status expect-status = $expect-status)
             (show ' ' givien-ret = $given-ret expect-ret = $expect-ret))))
     (fn (e msg) (if (not (is $e ret)) (raise $e $msg)))))
-
